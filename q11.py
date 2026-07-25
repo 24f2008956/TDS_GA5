@@ -256,35 +256,32 @@ def _build_tool_arguments(tool: dict, incident: dict, evidence: List[str]) -> di
     
     args = {}
     
-    service_val = str(incident.get("service") or incident.get("target") or incident.get("serviceName") or "unknown")
-    host_val = str(incident.get("host") or incident.get("hostname") or incident.get("node") or "unknown")
-    region_val = str(incident.get("region") or incident.get("datacenter") or incident.get("zone") or "global")
-    start_val = str(incident.get("startTime") or incident.get("startTs") or incident.get("since") or "")
-    end_val = str(incident.get("endTime") or incident.get("endTs") or incident.get("until") or "")
-    trace_val = str(incident.get("traceId") or (evidence[0] if evidence and str(evidence[0]).startswith("ev_") else ""))
-    error_val = str(incident.get("errorId") or incident.get("errorCode") or (evidence[1] if len(evidence) > 1 and str(evidence[1]).startswith("ev_") else ""))
+    # Case-derived mapping
+    mappings = {
+        "service": incident.get("service") or incident.get("target") or incident.get("serviceName") or "unknown",
+        "host": incident.get("host") or incident.get("hostname") or incident.get("node") or "unknown",
+        "region": incident.get("region") or incident.get("datacenter") or incident.get("zone") or "global",
+        "startTime": incident.get("startTime") or incident.get("startTs") or incident.get("since") or "",
+        "endTime": incident.get("endTime") or incident.get("endTs") or incident.get("until") or "",
+        "traceId": incident.get("traceId") or (evidence[0] if evidence and str(evidence[0]).startswith("ev_") else ""),
+        "errorId": incident.get("errorId") or incident.get("errorCode") or (evidence[1] if len(evidence) > 1 and str(evidence[1]).startswith("ev_") else ""),
+        "evidenceIds": evidence,
+        "evidence": evidence,
+    }
     
     for pname, pdef in (props.items() if isinstance(props, dict) else {}):
-        ptype = str(pdef.get("type") if isinstance(pdef, dict) else "")
+        ptype = str(pdef.get("type") if isinstance(pdef, dict) else "").lower()
         pl = pname.lower()
         
-        if pl in ("service", "servicename", "svc"):
-            args[pname] = service_val
-        elif pl in ("host", "hostname", "node"):
-            args[pname] = host_val
-        elif pl in ("region", "datacenter", "dc", "zone"):
-            args[pname] = region_val
-        elif pl in ("starttime", "startts", "since", "from"):
-            args[pname] = start_val
-        elif pl in ("endtime", "endts", "until", "to"):
-            args[pname] = end_val
-        elif pl in ("traceid", "trace_id"):
-            args[pname] = trace_val
-        elif pl in ("errorid", "error_id", "errorcode"):
-            args[pname] = error_val
-        elif pl in ("evidenceids", "evidence_ids", "evidence"):
-            args[pname] = evidence
-        elif pname in required:
+        # Try to find a matching mapping
+        matched = False
+        for map_key, map_val in mappings.items():
+            if map_key == pl or pl in map_key or map_key in pl:
+                args[pname] = map_val
+                matched = True
+                break
+                
+        if not matched and pname in required:
             if ptype == "string":
                 args[pname] = ""
             elif ptype in ("integer", "number"):
@@ -295,9 +292,28 @@ def _build_tool_arguments(tool: dict, incident: dict, evidence: List[str]) -> di
                 args[pname] = []
             elif ptype == "object":
                 args[pname] = {}
-            else:
-                args[pname] = ""
                 
+    # If no schema or no properties matched, provide sensible defaults
+    if not args and props:
+        for pname, pdef in props.items():
+            ptype = str(pdef.get("type") if isinstance(pdef, dict) else "").lower()
+            if ptype == "string":
+                args[pname] = ""
+            elif ptype in ("integer", "number"):
+                args[pname] = 0
+            elif ptype == "boolean":
+                args[pname] = False
+            elif ptype == "array":
+                args[pname] = []
+            elif ptype == "object":
+                args[pname] = {}
+                
+    if not args:
+        args = {
+            "service": mappings["service"],
+            "evidenceIds": evidence
+        }
+        
     return args
 
 # =============================================================
@@ -359,14 +375,14 @@ def _build_trace(
         # 1. Root server span
         _make_span(trace_id, server_id, "", "POST /v2/incidents", 2, common),
         # 2. Agent invocation span
-        _make_span(trace_id, agent_id, server_id, "invoke_agent incident-response", 1, common),
-        # 3. Model span (CLIENT kind for external LLM call)
-        _make_span(trace_id, model_id, agent_id, "chat incident-plan", 3, common + [
+        _make_span(trace_id, agent_id, server_id, "invoke_agent", 1, common),
+        # 3. Model span
+        _make_span(trace_id, model_id, agent_id, "chat", 3, common + [
             _attr("gen_ai.operation.name", "chat"),
             _attr("gen_ai.request.model", "local-model")
         ]),
         # 4. Tool execution span
-        _make_span(trace_id, tool_id, agent_id, "execute_tool " + tool_name, 1, common + [
+        _make_span(trace_id, tool_id, agent_id, "execute_tool", 1, common + [
             _attr("ga5.action.id", action_id),
             _attr("ga5.call.id", call_id),
             _attr("ga5.attempt", 1),
@@ -374,7 +390,7 @@ def _build_trace(
             _attr("gen_ai.tool.call.id", call_id)
         ]),
         # 5. Outbound tool call span
-        _make_span(trace_id, client_id, tool_id, "POST tool/" + tool_name, 3, common + [
+        _make_span(trace_id, client_id, tool_id, "POST tool", 3, common + [
             _attr("ga5.action.id", action_id),
             _attr("ga5.call.id", call_id),
             _attr("ga5.attempt", 1),
@@ -479,16 +495,6 @@ async def create_incident(request: Request):
             "toolName": tool_name,
             "arguments": arguments,
         }],
-        "diagnosticDispatches": [{
-            "actionId": action_id,
-            "toolName": tool_name,
-            "arguments": arguments,
-        }],
-        "diagnosticToolDispatches": [{
-            "actionId": action_id,
-            "toolName": tool_name,
-            "arguments": arguments,
-        }],
         "effectsAllowed": False,
     }
 
@@ -569,7 +575,7 @@ async def receive_receipt(run_id: str, request: Request):
             for rs in state.get("otlp", {}).get("resourceSpans", []):
                 for ss in rs.get("scopeSpans", []):
                     for span in ss.get("spans", []):
-                        if isinstance(span.get("name"), str) and span["name"].startswith("POST tool/"):
+                        if isinstance(span.get("name"), str) and span["name"].startswith("POST tool"):
                             span["attributes"].append(_attr("ga5.receipt.id", receipt_id))
                             span["attributes"].append(_attr("http.status_code", outcome.get("status", 200)))
                             span["attributes"].append(_attr("ga5.call.id", call_id))
