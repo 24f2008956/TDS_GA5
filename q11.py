@@ -88,45 +88,34 @@ def diagnose(incident):
         []
     )
 
-
     transcript = incident.get(
         "transcript",
         ""
     ).lower()
 
-
-
     selected = None
-    evidence=[]
-
 
 
     for cause in allowed:
 
-        score=0
+        score = 0
 
         for word in cause.lower().split():
 
-            if len(word)>3 and word in transcript:
-
+            if len(word) > 3 and word in transcript:
                 score += 1
 
 
-
         if score:
-
-            selected=cause
+            selected = cause
             break
 
 
-
     if selected is None and allowed:
-
-        selected=allowed[0]
-
+        selected = allowed[0]
 
 
-    ev = extract_evidence(
+    evidence = extract_evidence(
         incident.get(
             "transcript",
             ""
@@ -134,25 +123,10 @@ def diagnose(incident):
     )
 
 
-    evidence=ev[:4]
-
-
-    while len(evidence)<2:
-
-        evidence.append(
-            "ev_unknown"
-        )
-
-
     return {
-
-        "rootCause":selected,
-
-        "evidence":
-            evidence[:4]
-
+        "rootCause": selected,
+        "evidence": evidence[:4]
     }
-
 
 
 # =====================================================
