@@ -5,8 +5,7 @@ POST /v2/incidents/{run_id}/receipts -> bind tool outcomes / approvals
 GET  /v2/incidents/{run_id}     -> current state
 
 Storage: SQLite WAL + atomic JSON files (durable across restarts).
-Conflict detection: semantic digest over (incident, policy, toolCatalog),
-NOT over volatile metadata like runId/publicMarker.
+Conflict detection: semantic digest over (incident, policy, toolCatalog).
 """
 import asyncio
 import hashlib
@@ -112,7 +111,6 @@ def _put_incident(run_id: str, conflict_key: str, response: dict, body: dict) ->
             )
     except Exception as e:
         logger.error("q11 put incident error: %s", e)
-    # mirror to atomic file for durability
     _atomic_json_write(
         os.path.join(tempfile.gettempdir(), f"q11_incident_{run_id}.json"),
         {"conflictKey": conflict_key, "response": response, "body": body},
@@ -144,7 +142,7 @@ def _put_receipt(key: str, response: dict) -> None:
         logger.error("q11 put receipt error: %s", e)
 
 # =============================================================
-# Redaction (push 6/7 -> 7/7)
+# Redaction
 # =============================================================
 _SECRET_RES = (
     re.compile(r"sk[-_][A-Za-z0-9_-]{12,}", re.I),
@@ -208,7 +206,6 @@ def _diagnose(incident: dict) -> dict:
     root_cause = best if best is not None else (allowed[0] if allowed else "unknown")
 
     evidence = _extract_evidence(incident.get("transcript") or "")
-    # supplement from structured fields
     for field in ("errorId", "traceId", "correlationId", "eventId"):
         v = incident.get(field)
         if isinstance(v, str) and v.startswith("ev_") and v not in evidence:
@@ -221,7 +218,7 @@ def _diagnose(incident: dict) -> dict:
     return {"rootCause": root_cause, "evidenceIds": evidence[:4]}
 
 # =============================================================
-# Tool selection (diagnostic, not effect)
+# Tool selection & Argument building
 # =============================================================
 def _choose_diagnostic_tool(tools: list, policy: dict) -> Optional[dict]:
     if not isinstance(tools, list) or not tools:
@@ -238,7 +235,6 @@ def _choose_diagnostic_tool(tools: list, policy: dict) -> Optional[dict]:
     ]
     if not candidates:
         return None
-    # prefer diagnostic-sounding tools
     for kw in ("diagnos", "inspect", "check", "analyze", "probe", "trace"):
         for t in candidates:
             if kw in t["name"].lower():
@@ -246,21 +242,22 @@ def _choose_diagnostic_tool(tools: list, policy: dict) -> Optional[dict]:
     return candidates[0]
 
 def _build_tool_arguments(tool: dict, incident: dict, evidence: List[str]) -> dict:
-    """Case-derived arguments — use fields the tool actually needs."""
-    name = (tool.get("name") or "").lower()
     schema = tool.get("inputSchema") or {}
     props = schema.get("properties") if isinstance(schema, dict) else {}
-
-    args: Dict[str, Any] = {}
+    
+    args = {}
     service = incident.get("service") or incident.get("target") or ""
     host = incident.get("host") or incident.get("hostname") or ""
     region = incident.get("region") or incident.get("datacenter") or ""
     start_ts = incident.get("startTime") or incident.get("startTs") or incident.get("since") or ""
     end_ts = incident.get("endTime") or incident.get("endTs") or incident.get("until") or ""
+    trace_id = incident.get("traceId") or (evidence[0] if evidence and str(evidence[0]).startswith("ev_") else "")
+    error_id = incident.get("errorId") or (evidence[1] if len(evidence) > 1 and str(evidence[1]).startswith("ev_") else "")
 
-    for pname, pdef in (props.items() if isinstance(props, dict) else []):
+    for pname, pdef in (props.items() if isinstance(props, dict) else {}):
         ptype = (pdef.get("type") if isinstance(pdef, dict) else "") or ""
         pl = pname.lower()
+        
         if pl in ("service", "servicename", "svc"):
             args[pname] = service or "unknown"
         elif pl in ("host", "hostname", "node"):
@@ -274,7 +271,9 @@ def _build_tool_arguments(tool: dict, incident: dict, evidence: List[str]) -> di
         elif pl in ("evidence", "evidenceids", "evidence_ids"):
             args[pname] = evidence
         elif pl in ("traceid", "trace_id"):
-            args[pname] = incident.get("traceId") or (evidence[0] if evidence else "")
+            args[pname] = trace_id or ""
+        elif pl in ("errorid", "error_id"):
+            args[pname] = error_id or ""
         elif ptype == "string":
             args[pname] = ""
         elif ptype == "integer" or ptype == "number":
@@ -285,16 +284,13 @@ def _build_tool_arguments(tool: dict, incident: dict, evidence: List[str]) -> di
             args[pname] = []
         elif ptype == "object":
             args[pname] = {}
+        else:
+            args[pname] = ""
 
-    # Always include service + evidence if schema is loose/empty
-    if "service" not in args and service:
-        args["service"] = service
-    if "evidence" not in args and "evidenceids" not in args:
-        args["evidence"] = evidence
     return args
 
 # =============================================================
-# OTLP trace
+# OTLP trace (Exactly 7 spans)
 # =============================================================
 def _attr(key: str, value: Any) -> dict:
     if isinstance(value, bool):
@@ -338,7 +334,6 @@ def _build_trace(
     server_id   = uuid.uuid4().hex[:16]
     agent_id    = uuid.uuid4().hex[:16]
     model_id    = uuid.uuid4().hex[:16]
-    plan_id     = uuid.uuid4().hex[:16]
     tool_id     = uuid.uuid4().hex[:16]
     client_id   = uuid.uuid4().hex[:16]
     approval_id = uuid.uuid4().hex[:16]
@@ -353,49 +348,18 @@ def _build_trace(
     spans = [
         # 1. Root server span
         _make_span(trace_id, server_id, "", "POST /v2/incidents", 2, common),
-        # 2. Agent invocation
-        _make_span(trace_id, agent_id, server_id,
-                   "invoke_agent incident-response", 1,
-                   common + [_attr("ga5.agent.name", "incident-agent")]),
-        # 3. Model plan span
-        _make_span(trace_id, model_id, agent_id,
-                   "chat incident-plan", 3,
-                   common + [
-                       _attr("gen_ai.operation.name", "chat"),
-                       _attr("gen_ai.request.model", "local-model"),
-                   ]),
-        # 4. Plan construction span (child of model)
-        _make_span(trace_id, plan_id, model_id,
-                   "plan build_proposal", 1,
-                   common + [_attr("ga5.action.id", action_id)]),
-        # 5. Tool execution span (child of agent)
-        _make_span(trace_id, tool_id, agent_id,
-                   "execute_tool " + tool_name, 1,
-                   common + [
-                       _attr("ga5.action.id", action_id),
-                       _attr("gen_ai.tool.name", tool_name),
-                       _attr("gen_ai.tool.call.id", call_id),
-                   ]),
-        # 6. Outbound tool call span (child of tool)
-        _make_span(trace_id, client_id, tool_id,
-                   "POST tool/" + tool_name, 3,
-                   common + [
-                       _attr("ga5.action.id", action_id),
-                       _attr("ga5.attempt", 1),
-                       _attr("gen_ai.tool.call.id", call_id),
-                   ]),
-        # 7. Approval gate (child of agent)
-        _make_span(trace_id, approval_id, agent_id,
-                   "approval_gate", 1,
-                   common + [
-                       _attr("ga5.action.id", action_id),
-                       _attr("ga5.approval.required", True),
-                   ]),
-        # 8. Final join (child of agent) with link to tool span
-        _make_span(trace_id, join_id, agent_id,
-                   "incident.join", 1,
-                   common + [_attr("ga5.action.id", action_id)],
-                   links=[{"traceId": trace_id, "spanId": tool_id}]),
+        # 2. Agent invocation span
+        _make_span(trace_id, agent_id, server_id, "invoke_agent", 1, common + [_attr("ga5.agent.name", "incident-agent")]),
+        # 3. Model span
+        _make_span(trace_id, model_id, agent_id, "chat", 3, common + [_attr("gen_ai.operation.name", "chat"), _attr("gen_ai.request.model", "local-model")]),
+        # 4. Tool execution span
+        _make_span(trace_id, tool_id, agent_id, "execute_tool", 1, common + [_attr("ga5.action.id", action_id), _attr("ga5.call.id", call_id), _attr("gen_ai.tool.name", tool_name), _attr("gen_ai.tool.call.id", call_id)]),
+        # 5. Outbound tool call span
+        _make_span(trace_id, client_id, tool_id, "POST tool/" + tool_name, 3, common + [_attr("ga5.action.id", action_id), _attr("ga5.call.id", call_id), _attr("ga5.attempt", 1), _attr("gen_ai.tool.call.id", call_id)]),
+        # 6. Approval gate span
+        _make_span(trace_id, approval_id, agent_id, "approval_gate", 1, common + [_attr("ga5.action.id", action_id), _attr("ga5.call.id", call_id), _attr("ga5.approval.required", True)]),
+        # 7. Final join span (with link to tool span)
+        _make_span(trace_id, join_id, agent_id, "incident.join", 1, common + [_attr("ga5.action.id", action_id), _attr("ga5.call.id", call_id)], links=[{"traceId": trace_id, "spanId": tool_id}]),
     ]
 
     traceparent = f"00-{trace_id}-{client_id}-01"
@@ -432,7 +396,7 @@ async def create_incident(request: Request):
     if not isinstance(incident, dict) or not incident:
         raise HTTPException(status_code=422, detail="incident is required")
 
-    # ---- Semantic conflict key (NOT over runId/marker) ----
+    # Semantic conflict key (ignores volatile fields like runId/publicMarker)
     conflict_key = _digest({
         "incident": incident,
         "policy": policy,
@@ -442,15 +406,13 @@ async def create_incident(request: Request):
     existing = _get_incident(run_id)
     if existing is not None:
         if existing["conflictKey"] == conflict_key:
-            # Idempotent replay
             return JSONResponse(content=existing["response"], media_type="application/json")
-        # Different semantics under same runId -> 409
         raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
 
-    # ---- Diagnosis ----
+    # Diagnosis
     diagnosis = _diagnose(incident)
 
-    # ---- Tool selection ----
+    # Tool selection
     tool = _choose_diagnostic_tool(tools, policy)
     if tool is None:
         raise HTTPException(status_code=422, detail="no diagnostic tool available")
@@ -476,7 +438,7 @@ async def create_incident(request: Request):
     )
     dispatch["traceparent"] = traceparent
 
-    # ---- Proposal (BEFORE effects) ----
+    # Proposal (BEFORE effects)
     proposal = {
         "rootCause": diagnosis["rootCause"],
         "evidenceIds": diagnosis["evidenceIds"],
@@ -539,7 +501,7 @@ async def receive_receipt(run_id: str, request: Request):
     state = existing["response"]
     receipt_id = body.get("receiptId") or ("receipt_" + uuid.uuid4().hex[:16])
 
-    # ---- Tool outcome receipts ----
+    # Tool outcome receipts
     if isinstance(body.get("outcomes"), list):
         for outcome in body["outcomes"]:
             if not isinstance(outcome, dict):
@@ -557,17 +519,17 @@ async def receive_receipt(run_id: str, request: Request):
             state["toolResults"].append(tool_result)
             state["receiptLog"].append(tool_result)
 
-            # annotate the outbound tool span
+            # Annotate the outbound tool span with correlation IDs
             for rs in state.get("otlp", {}).get("resourceSpans", []):
                 for ss in rs.get("scopeSpans", []):
                     for span in ss.get("spans", []):
                         if isinstance(span.get("name"), str) and span["name"].startswith("POST tool/"):
                             span["attributes"].append(_attr("ga5.receipt.id", receipt_id))
-                            span["attributes"].append(
-                                _attr("http.status_code", outcome.get("status", 200))
-                            )
+                            span["attributes"].append(_attr("http.status_code", outcome.get("status", 200)))
+                            span["attributes"].append(_attr("ga5.call.id", outcome.get("callId", "")))
+                            span["attributes"].append(_attr("ga5.action.id", outcome.get("actionId", "")))
 
-        # diagnostic phase complete -> propose effect
+        # Diagnostic phase complete -> propose effect
         state["dispatches"] = []
         effect_tools = (existing["body"].get("policy") or {}).get("effectTools") or []
         if effect_tools and isinstance(effect_tools, list):
@@ -595,7 +557,7 @@ async def receive_receipt(run_id: str, request: Request):
         _put_receipt(receipt_key, state)
         return JSONResponse(content=_scrub(state), media_type="application/json")
 
-    # ---- Approval receipts ----
+    # Approval receipts
     if isinstance(body.get("approvals"), list):
         for approval in body["approvals"]:
             if not isinstance(approval, dict):
@@ -612,7 +574,7 @@ async def receive_receipt(run_id: str, request: Request):
         _put_receipt(receipt_key, state)
         return JSONResponse(content=_scrub(state), media_type="application/json")
 
-    # ---- Default completion ----
+    # Default completion
     state["dispatches"] = []
     state["status"] = "completed"
     _put_incident(run_id, existing["conflictKey"], state, existing["body"])
