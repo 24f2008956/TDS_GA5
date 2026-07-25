@@ -1,45 +1,92 @@
 import json
-import time
 import uuid
 import hashlib
 import re
+import time
+
 from typing import Dict, Any
 
 from fastapi import APIRouter, HTTPException, Request
 
+
 router = APIRouter()
 
+
+# =====================================================
+# Persistent memory
+# =====================================================
+
 INCIDENTS_DB: Dict[str, Dict[str, Any]] = {}
-RECEIPT_DB: Dict[str, str] = {}
+
+RECEIPTS_DB: Dict[str, str] = {}
+
+RECEIPT_IDS: Dict[str, str] = {}
+
 
 
 # =====================================================
 # Helpers
 # =====================================================
 
-def stable_hash(obj):
+
+def stable_hash(data):
+
     return hashlib.sha256(
         json.dumps(
-            obj,
+            data,
             sort_keys=True,
             separators=(",", ":")
         ).encode()
     ).hexdigest()
 
 
+
 def make_id(prefix):
-    return prefix + "_" + uuid.uuid4().hex[:12]
 
-
-def extract_evidence(text):
-    ids = re.findall(
-        r"\[(ev_[A-Za-z0-9_-]+)\]",
-        text
+    return (
+        prefix
+        + "_"
+        + uuid.uuid4().hex[:16]
     )
-    return list(dict.fromkeys(ids))[:4]
 
 
-def choose_root_cause(incident):
+
+def make_hex_id(length):
+
+    return uuid.uuid4().hex[:length]
+
+
+
+def extract_evidence_lines(transcript):
+
+    result=[]
+
+    for line in transcript.splitlines():
+
+        m=re.search(
+            r"\[(ev_[A-Za-z0-9_-]+)\]",
+            line
+        )
+
+        if m:
+
+            result.append(
+                {
+                    "id":m.group(1),
+                    "text":line
+                }
+            )
+
+    return result
+
+
+
+# =====================================================
+# Diagnosis planner
+# =====================================================
+
+
+def plan_diagnosis(incident):
 
     allowed = incident.get(
         "allowedRootCauses",
@@ -49,65 +96,179 @@ def choose_root_cause(incident):
     transcript = incident.get(
         "transcript",
         ""
-    ).lower()
-
-    best = None
-
-    for cause in allowed:
-        score = 0
-
-        for word in cause.lower().split():
-            if word in transcript:
-                score += 1
-
-        if score > 0:
-            best = cause
-            break
-
-    if best:
-        return best
-
-    if allowed:
-        return allowed[0]
-
-    return "unknown"
+    )
 
 
-def choose_tool(tool_catalog, policy):
+    evidence_lines = extract_evidence_lines(
+        transcript
+    )
 
-    effects = policy.get(
+
+    best_root = None
+    best_score = -1
+    best_evidence=[]
+
+
+    for root in allowed:
+
+        score=0
+        matched=[]
+
+        words=[
+            w.lower()
+            for w in root.split()
+            if len(w)>3
+        ]
+
+
+        for item in evidence_lines:
+
+            text=item["text"].lower()
+
+
+            hits=0
+
+            for w in words:
+
+                if w in text:
+                    hits+=1
+
+
+            if hits:
+
+                score += hits
+
+                matched.append(
+                    item["id"]
+                )
+
+
+        if score > best_score:
+
+            best_score=score
+            best_root=root
+            best_evidence=matched
+
+
+
+    if not best_root and allowed:
+
+        best_root=allowed[0]
+
+
+
+    if len(best_evidence)<2:
+
+        # fallback only if incident has insufficient matching lines
+
+        for e in evidence_lines:
+
+            if e["id"] not in best_evidence:
+
+                best_evidence.append(
+                    e["id"]
+                )
+
+            if len(best_evidence)==2:
+                break
+
+
+
+    return {
+
+        "rootCause":best_root,
+
+        "evidence":
+            list(
+                dict.fromkeys(
+                    best_evidence
+                )
+            )[:4]
+
+    }
+
+
+
+
+# =====================================================
+# Tool planner
+# =====================================================
+
+
+def choose_diagnostic_tool(
+    tools,
+    policy
+):
+
+    effect_tools = policy.get(
         "effectTools",
         []
     )
 
-    for tool in tool_catalog:
-        if tool.get("name") not in effects:
-            return tool.get("name")
+
+    for tool in tools:
+
+        if tool.get("name") not in effect_tools:
+
+            return tool
+
+
 
     return None
 
 
 
+
+def choose_effect_tool(
+    tools,
+    policy
+):
+
+    allowed = policy.get(
+        "effectTools",
+        []
+    )
+
+
+    for tool in tools:
+
+        if tool.get("name") in allowed:
+
+            return tool
+
+
+    return None
+
+
+
+
 # =====================================================
-# OTLP
+# OTLP Trace
 # =====================================================
 
-def attr(key, value):
 
-    if isinstance(value, int):
+def attribute(
+    key,
+    value
+):
+
+    if isinstance(value,int):
+
         return {
-            "key": key,
-            "value": {
-                "intValue": value
+            "key":key,
+            "value":{
+                "intValue":value
             }
         }
 
+
     return {
-        "key": key,
-        "value": {
-            "stringValue": str(value)
+        "key":key,
+        "value":{
+            "stringValue":str(value)
         }
     }
+
 
 
 
@@ -116,414 +277,273 @@ def create_trace(
     marker,
     action_id,
     call_id,
-    tool_name
+    tool_name,
+    receipt_id=""
 ):
 
+
     trace_id = hashlib.sha256(
-        (run_id+"trace").encode()
+        (
+            run_id
+            +
+            "trace"
+        ).encode()
     ).hexdigest()[:32]
 
 
-    server_id = uuid.uuid4().hex[:16]
-    agent_id = uuid.uuid4().hex[:16]
-    model_id = uuid.uuid4().hex[:16]
-    tool_id = uuid.uuid4().hex[:16]
-    client_id = uuid.uuid4().hex[:16]
-    join_id = uuid.uuid4().hex[:16]
+
+    server_id=make_hex_id(16)
+    agent_id=make_hex_id(16)
+    model_id=make_hex_id(16)
+    exec_id=make_hex_id(16)
+    client_id=make_hex_id(16)
+    join_id=make_hex_id(16)
 
 
-    common = [
-        attr(
+
+    common=[
+
+        attribute(
             "ga5.run.id",
             run_id
         ),
-        attr(
+
+        attribute(
             "ga5.public.marker",
             marker
         )
+
     ]
+
 
 
     spans=[]
 
 
+
     spans.append({
+
         "traceId":trace_id,
+
         "spanId":server_id,
+
         "parentSpanId":"",
-        "name":"POST /v2/incidents",
+
+        "name":
+            "POST /v2/incidents",
+
         "kind":2,
-        "attributes":common
+
+        "attributes":
+            common
+
     })
 
 
+
     spans.append({
+
         "traceId":trace_id,
+
         "spanId":agent_id,
+
         "parentSpanId":server_id,
-        "name":"invoke_agent incident-response",
+
+        "name":
+            "invoke_agent incident-response",
+
         "kind":1,
-        "attributes":common
+
+        "attributes":
+            common
+
     })
 
 
+
     spans.append({
+
         "traceId":trace_id,
+
         "spanId":model_id,
+
         "parentSpanId":agent_id,
-        "name":"chat incident-plan",
+
+        "name":
+            "chat incident-plan",
+
         "kind":3,
+
         "attributes":
-            common + [
-                attr(
-                    "gen_ai.operation.name",
-                    "chat"
-                ),
-                attr(
-                    "gen_ai.request.model",
-                    "local-model"
-                )
+            common
+            +
+            [
+
+            attribute(
+                "gen_ai.operation.name",
+                "chat"
+            ),
+
+            attribute(
+                "gen_ai.request.model",
+                "local-model"
+            )
+
             ]
+
     })
 
 
+
     spans.append({
+
         "traceId":trace_id,
-        "spanId":tool_id,
+
+        "spanId":exec_id,
+
         "parentSpanId":agent_id,
-        "name":"execute_tool "+tool_name,
+
+        "name":
+            "execute_tool "+tool_name,
+
         "kind":1,
+
         "attributes":
-            common + [
-                attr(
-                    "ga5.action.id",
-                    action_id
-                ),
-                attr(
-                    "gen_ai.tool.name",
-                    tool_name
-                ),
-                attr(
-                    "gen_ai.tool.call.id",
-                    call_id
-                ),
-                attr(
-                    "gen_ai.operation.name",
-                    "execute_tool"
-                )
+            common
+            +
+            [
+
+            attribute(
+                "ga5.action.id",
+                action_id
+            ),
+
+            attribute(
+                "gen_ai.tool.name",
+                tool_name
+            ),
+
+            attribute(
+                "gen_ai.tool.call.id",
+                call_id
+            ),
+
+            attribute(
+                "gen_ai.operation.name",
+                "execute_tool"
+            )
+
             ]
+
     })
 
 
+
     spans.append({
+
         "traceId":trace_id,
+
         "spanId":client_id,
-        "parentSpanId":tool_id,
-        "name":"POST tool/"+tool_name,
+
+        "parentSpanId":exec_id,
+
+        "name":
+            "POST tool/"+tool_name,
+
         "kind":3,
+
+
         "attributes":
-            common + [
-                attr(
-                    "ga5.action.id",
-                    action_id
-                ),
-                attr(
-                    "ga5.attempt",
-                    1
-                ),
-                attr(
-                    "ga5.receipt.id",
-                    ""
-                ),
-                attr(
-                    "http.request.method",
-                    "POST"
-                ),
-                attr(
-                    "http.request.resend_count",
-                    0
-                ),
-                attr(
-                    "http.status_code",
-                    200
-                )
+            common
+            +
+            [
+
+            attribute(
+                "ga5.action.id",
+                action_id
+            ),
+
+            attribute(
+                "gen_ai.tool.call.id",
+                call_id
+            ),
+
+            attribute(
+                "ga5.attempt",
+                1
+            ),
+
+            attribute(
+                "ga5.receipt.id",
+                receipt_id
+            ),
+
+            attribute(
+                "http.request.method",
+                "POST"
+            ),
+
+            attribute(
+                "http.request.resend_count",
+                0
+            )
+
             ]
+
     })
+
 
 
     spans.append({
+
         "traceId":trace_id,
+
         "spanId":join_id,
+
         "parentSpanId":agent_id,
-        "name":"incident.join",
+
+        "name":
+            "incident.join",
+
         "kind":1,
-        "attributes":common
+
+        "links":[
+            {
+                "traceId":trace_id,
+                "spanId":exec_id
+            }
+        ],
+
+        "attributes":
+            common
+
     })
+
 
 
     traceparent = (
         "00-"
-        + trace_id
-        + "-"
-        + client_id
-        + "-01"
+        +
+        trace_id
+        +
+        "-"
+        +
+        client_id
+        +
+        "-01"
     )
 
 
     return spans, traceparent
 
 # =====================================================
-# POST /v2/incidents
+# RECEIPT HANDLER
 # =====================================================
 
-@router.post("/v2/incidents")
-async def create_incident(request: Request):
-
-    body = await request.json()
-
-    if body.get("profile") != "ga5-incident-agent/v2":
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid profile"
-        )
-
-
-    run_id = body.get("runId")
-
-    if not run_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing runId"
-        )
-
-
-    body_hash = stable_hash(body)
-
-
-    # -----------------------------
-    # Replay / Conflict
-    # -----------------------------
-
-    if run_id in INCIDENTS_DB:
-
-        old = INCIDENTS_DB[run_id]
-
-        if old["hash"] != body_hash:
-            raise HTTPException(
-                status_code=409,
-                detail="IDEMPOTENCY_CONFLICT"
-            )
-
-        return old["response"]
-
-
-
-    incident = body.get(
-        "incident",
-        {}
-    )
-
-    policy = body.get(
-        "policy",
-        {}
-    )
-
-    tools = body.get(
-        "toolCatalog",
-        []
-    )
-
-
-    transcript = incident.get(
-        "transcript",
-        ""
-    )
-
-
-    evidence = extract_evidence(
-        transcript
-    )
-
-
-    if len(evidence) < 2:
-        evidence = (
-            evidence +
-            ["ev_unknown"]
-        )[:2]
-
-
-    root = choose_root_cause(
-        incident
-    )
-
-
-    tool_name = choose_tool(
-        tools,
-        policy
-    )
-
-
-    if not tool_name:
-        raise HTTPException(
-            status_code=422,
-            detail="No diagnostic tool"
-        )
-
-
-    action_id = make_id(
-        "action"
-    )
-
-    call_id = make_id(
-        "call"
-    )
-
-
-    spans, traceparent = create_trace(
-        run_id,
-        body.get(
-            "publicMarker",
-            ""
-        ),
-        action_id,
-        call_id,
-        tool_name
-    )
-
-
-    dispatch = {
-
-        "actionId":
-            action_id,
-
-        "callId":
-            call_id,
-
-        "phase":
-            "diagnostic",
-
-        "toolName":
-            tool_name,
-
-        "arguments":
-            {
-                "service":
-                    incident.get(
-                        "service",
-                        ""
-                    )
-            },
-
-        "evidence":
-            evidence[:1],
-
-        "attempt":
-            1,
-
-        "traceparent":
-            traceparent
-    }
-
-
-
-    response = {
-
-        "runId":
-            run_id,
-
-        "status":
-            "waiting",
-
-
-        "diagnosis":
-            {
-                "rootCause":
-                    root,
-
-                "evidence":
-                    evidence[:4]
-            },
-
-
-        "dispatches":
-            [
-                dispatch
-            ],
-
-
-        "approvals":
-            [],
-
-
-        "chosenEffect":
-            None,
-
-
-        "suppressed":
-            [],
-
-
-        "actionLog":
-            [
-                dispatch
-            ],
-
-
-        "receiptLog":
-            [],
-
-
-        "otlp":
-            {
-                "resourceSpans":
-                    [
-                        {
-                            "scopeSpans":
-                                [
-                                    {
-                                        "spans":
-                                            spans
-                                    }
-                                ]
-                        }
-                    ]
-            }
-    }
-
-
-    INCIDENTS_DB[run_id] = {
-
-        "hash":
-            body_hash,
-
-        "response":
-            response,
-
-        "pending":
-            {
-                action_id:
-                    dispatch
-            },
-
-        "body":
-            body
-    }
-
-
-    return response
-
-
-
-# =====================================================
-# RECEIPTS
-# =====================================================
-
-@router.post(
-    "/v2/incidents/{run_id}/receipts"
-)
+@router.post("/v2/incidents/{run_id}/receipts")
 async def receive_receipt(
-    run_id:str,
-    request:Request
+    run_id: str,
+    request: Request
 ):
 
     if run_id not in INCIDENTS_DB:
@@ -535,37 +555,39 @@ async def receive_receipt(
 
     body = await request.json()
 
-
     receipt_hash = stable_hash(body)
 
 
-    if run_id in RECEIPT_DB:
+    state = INCIDENTS_DB[run_id]
 
-        if RECEIPT_DB[run_id] != receipt_hash:
+
+    # replay receipt
+    if state.get("lastReceiptHash"):
+
+        if state["lastReceiptHash"] != receipt_hash:
             raise HTTPException(
                 status_code=409,
                 detail="IDEMPOTENCY_CONFLICT"
             )
 
-        return INCIDENTS_DB[run_id]["response"]
+        return state["response"]
 
 
-
-    state = INCIDENTS_DB[run_id]
 
     response = state["response"]
 
 
-
-    # -----------------------------
-    # Store safe receipt only
-    # -----------------------------
+    # -------------------------------
+    # TOOL OUTCOME RECEIPTS
+    # -------------------------------
 
     if "outcomes" in body:
 
+
         for outcome in body["outcomes"]:
 
-            safe_receipt = {
+
+            receipt = {
 
                 "receiptId":
                     body.get(
@@ -607,32 +629,78 @@ async def receive_receipt(
 
 
             response["receiptLog"].append(
-                safe_receipt
+                receipt
             )
 
 
+
+            # update OTLP client span
+            for rs in response["otlp"]["resourceSpans"]:
+
+                for ss in rs["scopeSpans"]:
+
+                    for span in ss["spans"]:
+
+
+                        if span["name"].startswith(
+                            "POST tool/"
+                        ):
+
+
+                            span["attributes"].append(
+                                attr(
+                                    "ga5.receipt.id",
+                                    receipt["receiptId"]
+                                )
+                            )
+
+
+                            span["attributes"].append(
+                                attr(
+                                    "ga5.receipt.nonce",
+                                    receipt["nonce"]
+                                )
+                            )
+
+
+                            span["attributes"].append(
+                                attr(
+                                    "http.status_code",
+                                    receipt["status"]
+                                )
+                            )
+
+
+
             # -------------------------
-            # Retry on 503
+            # 503 RETRY
             # -------------------------
 
-            if outcome.get(
-                "status"
-            ) == 503:
+            if outcome.get("status") == 503:
 
 
                 old = response["actionLog"][0]
 
 
-                retry = dict(old)
+                retry = old.copy()
+
 
                 retry["attempt"] = 2
 
+
+                parts = old["traceparent"].split("-")
+
+
+                new_span = uuid.uuid4().hex[:16]
+
+
                 retry["traceparent"] = (
-                    old["traceparent"][:35]
-                    +
-                    uuid.uuid4().hex[:16]
-                    +
-                    "-01"
+                    parts[0]
+                    + "-"
+                    + parts[1]
+                    + "-"
+                    + new_span
+                    + "-01"
                 )
 
 
@@ -640,99 +708,222 @@ async def receive_receipt(
                     retry
                 ]
 
+
                 response["actionLog"].append(
                     retry
                 )
 
 
-                response["status"]="waiting"
+                response["status"] = "waiting"
 
 
-                RECEIPT_DB[run_id]=receipt_hash
+                state["lastReceiptHash"] = receipt_hash
+
 
                 return response
 
 
 
             # -------------------------
-            # Timeout suppression
+            # TIMEOUT
             # -------------------------
 
-            if outcome.get(
-                "status"
-            ) == 0 and outcome.get(
-                "errorType"
-            ) == "timeout":
+            if (
+                outcome.get("status") == 0
+                and
+                outcome.get("errorType")
+                ==
+                "timeout"
+            ):
+
+
+                response["status"] = "failed"
+
+
+                response["dispatches"] = []
+
 
                 response["suppressed"].append(
-                    "effect_not_run_due_to_timeout"
+                    "effect_blocked_timeout"
                 )
 
-                response["dispatches"]=[]
 
-                response["status"]="failed"
+                state["lastReceiptHash"] = receipt_hash
 
-                RECEIPT_DB[run_id]=receipt_hash
 
                 return response
 
 
 
-    # -----------------------------
-    # Approval receipts
-    # -----------------------------
+        # diagnostic success
 
-    if "approvals" in body:
+        response["dispatches"] = []
 
-        for approval in body["approvals"]:
 
-            response["receiptLog"].append(
-                {
-                    "receiptId":
-                        body.get(
-                            "receiptId",
-                            make_id("receipt")
-                        ),
+        # choose effect
 
-                    "approvalId":
-                        approval.get(
-                            "approvalId"
-                        ),
+        policy = state["body"].get(
+            "policy",
+            {}
+        )
 
-                    "decision":
-                        approval.get(
-                            "decision"
-                        ),
 
-                    "nonce":
-                        approval.get(
-                            "nonce"
-                        )
-                }
+        effects = policy.get(
+            "effectTools",
+            []
+        )
+
+
+        if effects:
+
+
+            effect = effects[0]
+
+
+            action_id = (
+                response["actionLog"][0]
+                ["actionId"]
             )
 
 
-        response["status"]="completed"
+            call_id = make_id(
+                "call"
+            )
 
-        response["dispatches"]=[]
+
+            effect_dispatch = {
 
 
-        RECEIPT_DB[run_id]=receipt_hash
+                "actionId":
+                    action_id,
+
+
+                "callId":
+                    call_id,
+
+
+                "phase":
+                    "effect",
+
+
+                "toolName":
+                    effect,
+
+
+                "arguments":
+                    {
+                        "service":
+                            state["body"]
+                            ["incident"]
+                            .get(
+                                "service",
+                                ""
+                            )
+                    },
+
+
+                "evidence":
+                    response["diagnosis"]
+                    ["evidence"][:2],
+
+
+                "attempt":
+                    1,
+
+
+                "traceparent":
+                    response["actionLog"][0]
+                    ["traceparent"]
+
+            }
+
+
+
+            response["dispatches"] = [
+                effect_dispatch
+            ]
+
+
+            response["actionLog"].append(
+                effect_dispatch
+            )
+
+
+            response["chosenEffect"] = effect
+
+
+            response["status"]="waiting"
+
+
+            state["lastReceiptHash"] = receipt_hash
+
+
+            return response
+
+
+
+    # -------------------------------
+    # APPROVAL
+    # -------------------------------
+
+
+    if "approvals" in body:
+
+
+        for approval in body["approvals"]:
+
+
+            response["receiptLog"].append(
+
+                {
+
+                "receiptId":
+                    body.get(
+                        "receiptId",
+                        make_id("receipt")
+                    ),
+
+                "approvalId":
+                    approval.get(
+                        "approvalId"
+                    ),
+
+                "decision":
+                    approval.get(
+                        "decision"
+                    ),
+
+                "nonce":
+                    approval.get(
+                        "nonce"
+                    )
+
+                }
+
+            )
+
+
+        response["dispatches"] = []
+
+
+        response["status"] = "completed"
+
+
+        state["lastReceiptHash"] = receipt_hash
+
 
         return response
 
 
 
-    # -----------------------------
-    # Normal completion
-    # -----------------------------
+    # normal completion
 
-    response["dispatches"]=[]
+    response["dispatches"] = []
 
-    response["status"]="completed"
+    response["status"] = "completed"
 
 
-    RECEIPT_DB[run_id]=receipt_hash
+    state["lastReceiptHash"] = receipt_hash
 
 
     return response
@@ -741,12 +932,11 @@ async def receive_receipt(
 
 
 # =====================================================
-# GET
+# GET STORED STATE
 # =====================================================
 
-@router.get(
-    "/v2/incidents/{run_id}"
-)
+
+@router.get("/v2/incidents/{run_id}")
 async def get_incident(
     run_id:str
 ):
