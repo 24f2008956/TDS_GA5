@@ -83,7 +83,6 @@ def _digest(obj: Any) -> str:
     return hashlib.sha256(_canonical(obj).encode("utf-8")).hexdigest()
 
 def _get_incident(run_id: str) -> Optional[dict]:
-    # Primary: SQLite
     try:
         with sqlite3.connect(DB_PATH, timeout=10.0, isolation_level=None) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
@@ -100,7 +99,6 @@ def _get_incident(run_id: str) -> Optional[dict]:
     except Exception as e:
         logger.error("q11 get incident sqlite error: %s", e)
     
-    # Fallback: Atomic JSON (for durability across restarts)
     json_path = os.path.join(tempfile.gettempdir(), f"q11_incident_{run_id}.json")
     if os.path.exists(json_path):
         try:
@@ -122,7 +120,6 @@ def _put_incident(run_id: str, conflict_key: str, response: dict, body: dict) ->
     except Exception as e:
         logger.error("q11 put incident sqlite error: %s", e)
     
-    # Mirror to atomic file for durability
     _atomic_json_write(
         os.path.join(tempfile.gettempdir(), f"q11_incident_{run_id}.json"),
         {"conflictKey": conflict_key, "response": response, "body": body},
@@ -258,7 +255,6 @@ def _build_tool_arguments(tool: dict, incident: dict, evidence: List[str]) -> di
     props = schema.get("properties") if isinstance(schema, dict) else {}
     
     args = {}
-    # Case-derived mapping
     mapping = {
         "service": incident.get("service") or incident.get("target") or "unknown",
         "host": incident.get("host") or incident.get("hostname") or "unknown",
@@ -336,7 +332,6 @@ def _build_trace(
     action_id: str,
     call_id: str,
     tool_name: str,
-    root_cause: str,
 ) -> tuple:
     trace_id = hashlib.sha256(("q11|" + run_id).encode()).hexdigest()[:32]
 
@@ -352,24 +347,44 @@ def _build_trace(
     common = [
         _attr("ga5.run.id", run_id),
         _attr("ga5.public.marker", marker or ""),
-        _attr("ga5.root.cause", root_cause),
     ]
 
     spans = [
         # 1. Root server span
         _make_span(trace_id, server_id, "", "POST /v2/incidents", 2, common),
         # 2. Agent invocation span
-        _make_span(trace_id, agent_id, server_id, "invoke_agent", 1, common + [_attr("ga5.agent.name", "incident-agent")]),
+        _make_span(trace_id, agent_id, server_id, "invoke_agent incident-response", 1, common),
         # 3. Model span
-        _make_span(trace_id, model_id, agent_id, "chat", 3, common + [_attr("gen_ai.operation.name", "chat"), _attr("gen_ai.request.model", "local-model")]),
+        _make_span(trace_id, model_id, agent_id, "chat incident-plan", 3, common + [
+            _attr("gen_ai.operation.name", "chat"),
+            _attr("gen_ai.request.model", "local-model")
+        ]),
         # 4. Tool execution span
-        _make_span(trace_id, tool_id, agent_id, "execute_tool", 1, common + [_attr("ga5.action.id", action_id), _attr("ga5.call.id", call_id), _attr("gen_ai.tool.name", tool_name), _attr("gen_ai.tool.call.id", call_id)]),
+        _make_span(trace_id, tool_id, agent_id, "execute_tool " + tool_name, 1, common + [
+            _attr("ga5.action.id", action_id),
+            _attr("ga5.call.id", call_id),
+            _attr("gen_ai.tool.name", tool_name),
+            _attr("gen_ai.tool.call.id", call_id)
+        ]),
         # 5. Outbound tool call span
-        _make_span(trace_id, client_id, tool_id, "POST tool/" + tool_name, 3, common + [_attr("ga5.action.id", action_id), _attr("ga5.call.id", call_id), _attr("ga5.attempt", 1), _attr("gen_ai.tool.call.id", call_id)]),
+        _make_span(trace_id, client_id, tool_id, "POST tool/" + tool_name, 3, common + [
+            _attr("ga5.action.id", action_id),
+            _attr("ga5.call.id", call_id),
+            _attr("ga5.attempt", 1),
+            _attr("gen_ai.tool.call.id", call_id)
+        ]),
         # 6. Approval gate span
-        _make_span(trace_id, approval_id, agent_id, "approval_gate", 1, common + [_attr("ga5.action.id", action_id), _attr("ga5.call.id", call_id), _attr("ga5.approval.id", approval_id_val), _attr("ga5.approval.required", True)]),
+        _make_span(trace_id, approval_id, agent_id, "approval_gate", 1, common + [
+            _attr("ga5.action.id", action_id),
+            _attr("ga5.call.id", call_id),
+            _attr("ga5.approval.id", approval_id_val),
+            _attr("ga5.approval.required", True)
+        ]),
         # 7. Final join span (child of agent, linking to tool)
-        _make_span(trace_id, join_id, agent_id, "incident.join", 1, common + [_attr("ga5.action.id", action_id), _attr("ga5.call.id", call_id)], links=[{"traceId": trace_id, "spanId": tool_id}]),
+        _make_span(trace_id, join_id, agent_id, "incident.join", 1, common + [
+            _attr("ga5.action.id", action_id),
+            _attr("ga5.call.id", call_id)
+        ], links=[{"traceId": trace_id, "spanId": tool_id}]),
     ]
 
     traceparent = f"00-{trace_id}-{client_id}-01"
@@ -439,21 +454,23 @@ async def create_incident(request: Request):
         "phase": "diagnostic",
         "toolName": tool_name,
         "arguments": arguments,
+        "evidence": diagnosis["evidenceIds"],
         "evidenceIds": diagnosis["evidenceIds"],
         "attempt": 1,
     }
 
-    spans, traceparent = _build_trace(
-        run_id, marker, action_id, call_id, tool_name, diagnosis["rootCause"]
-    )
+    spans, traceparent = _build_trace(run_id, marker, action_id, call_id, tool_name)
     dispatch["traceparent"] = traceparent
 
     # Proposal (BEFORE effects)
     proposal = {
         "rootCause": diagnosis["rootCause"],
         "evidenceIds": diagnosis["evidenceIds"],
-        "dispatches": [dispatch],
-        "diagnosticDispatches": [dispatch], # Alias for grader safety
+        "diagnosticActions": [{
+            "actionId": action_id,
+            "toolName": tool_name,
+            "arguments": arguments,
+        }],
         "effectsAllowed": False,
     }
 
