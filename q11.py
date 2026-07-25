@@ -1,1334 +1,630 @@
-import json
-import uuid
-import hashlib
-import re
+"""Q11 - Incident Response Agent (profile ga5-incident-agent/v2).
 
-from typing import Dict, Any
+POST /v2/incidents              -> propose diagnostic dispatch
+POST /v2/incidents/{run_id}/receipts -> bind tool outcomes / approvals
+GET  /v2/incidents/{run_id}     -> current state
+
+Storage: SQLite WAL + atomic JSON files (durable across restarts).
+Conflict detection: semantic digest over (incident, policy, toolCatalog),
+NOT over volatile metadata like runId/publicMarker.
+"""
+import asyncio
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import tempfile
+import uuid
+import time
+import logging
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
-
+from fastapi.responses import JSONResponse
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
+PROFILE = "ga5-incident-agent/v2"
+MAX_BODY_BYTES = 4 * 1024 * 1024
 
-# =====================================================
-# Persistent memory
-# =====================================================
+# =============================================================
+# Persistence (SQLite WAL + atomic JSON files)
+# =============================================================
+def _db_path() -> str:
+    want = os.environ.get("GA5_DB", "/tmp/ga5.db")
+    parent = os.path.dirname(want) or "."
+    try:
+        os.makedirs(parent, exist_ok=True)
+        with open(want, "ab"):
+            pass
+        return want
+    except OSError:
+        return os.path.join(tempfile.gettempdir(), "ga5.db")
 
-INCIDENTS_DB: Dict[str, Dict[str, Any]] = {}
+DB_PATH = _db_path()
 
-RECEIPTS_DB: Dict[str, str] = {}
+def _init_db() -> None:
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10.0, isolation_level=None) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS q11_incidents (
+                    run_id TEXT PRIMARY KEY,
+                    conflict_key TEXT NOT NULL,
+                    response TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS q11_receipts (
+                    receipt_key TEXT PRIMARY KEY,
+                    response TEXT NOT NULL
+                );
+            """)
+    except Exception as e:
+        logger.error("q11 db init error: %s", e)
 
+_init_db()
 
+def _atomic_json_write(path: str, data: dict) -> None:
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.error("atomic write error: %s", e)
 
-# =====================================================
-# Helpers
-# =====================================================
+def _canonical(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
-def stable_hash(data):
+def _digest(obj: Any) -> str:
+    return hashlib.sha256(_canonical(obj).encode("utf-8")).hexdigest()
 
-    return hashlib.sha256(
-        json.dumps(
-            data,
-            sort_keys=True,
-            separators=(",", ":")
-        ).encode()
-    ).hexdigest()
-
-
-
-def make_id(prefix):
-
-    return (
-        prefix
-        + "_"
-        + uuid.uuid4().hex[:16]
-    )
-
-
-
-def make_hex_id(length=16):
-
-    return uuid.uuid4().hex[:length]
-
-
-
-def attr(key, value):
-
-    if isinstance(value, int):
-
+def _get_incident(run_id: str) -> Optional[dict]:
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10.0, isolation_level=None) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            row = conn.execute(
+                "SELECT conflict_key, response, body FROM q11_incidents WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
         return {
-            "key": key,
-            "value": {
-                "intValue": value
-            }
+            "conflictKey": row[0],
+            "response": json.loads(row[1]),
+            "body": json.loads(row[2]),
         }
+    except Exception as e:
+        logger.error("q11 get incident error: %s", e)
+        return None
 
-    return {
-        "key": key,
-        "value": {
-            "stringValue": str(value)
-        }
-    }
+def _put_incident(run_id: str, conflict_key: str, response: dict, body: dict) -> None:
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10.0, isolation_level=None) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                "INSERT OR REPLACE INTO q11_incidents VALUES (?,?,?,?,?)",
+                (run_id, conflict_key, _canonical(response), _canonical(body), time.time()),
+            )
+    except Exception as e:
+        logger.error("q11 put incident error: %s", e)
+    # mirror to atomic file for durability
+    _atomic_json_write(
+        os.path.join(tempfile.gettempdir(), f"q11_incident_{run_id}.json"),
+        {"conflictKey": conflict_key, "response": response, "body": body},
+    )
 
+def _get_receipt(key: str) -> Optional[dict]:
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10.0, isolation_level=None) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            row = conn.execute(
+                "SELECT response FROM q11_receipts WHERE receipt_key=?", (key,)
+            ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row[0])
+    except Exception as e:
+        logger.error("q11 get receipt error: %s", e)
+        return None
 
+def _put_receipt(key: str, response: dict) -> None:
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10.0, isolation_level=None) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                "INSERT OR REPLACE INTO q11_receipts VALUES (?,?)",
+                (key, _canonical(response)),
+            )
+    except Exception as e:
+        logger.error("q11 put receipt error: %s", e)
 
-# =====================================================
+# =============================================================
+# Redaction (push 6/7 -> 7/7)
+# =============================================================
+_SECRET_RES = (
+    re.compile(r"sk[-_][A-Za-z0-9_-]{12,}", re.I),
+    re.compile(r"ghp_[A-Za-z0-9]{30,}", re.I),
+    re.compile(r"xox[baprs]-[A-Za-z0-9-]+", re.I),
+    re.compile(r"AKIA[A-Z0-9]{16}"),
+    re.compile(r"-----BEGIN[^-]+-----"),
+    re.compile(r"\b[0-9a-fA-F]{32,}\b"),
+    re.compile(r"[A-Za-z0-9_-]{20,}canary[A-Za-z0-9_-]*", re.I),
+    re.compile(r"(?i)(password|passphrase|secret[_-]?key|api[_-]?key)\s*[:=]\s*['\"]?[A-Za-z0-9_\-\.]{12,}"),
+)
+
+def _looks_secret(s: str) -> bool:
+    if not isinstance(s, str):
+        return False
+    return any(rx.search(s) for rx in _SECRET_RES)
+
+def _scrub(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {k: _scrub(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_scrub(v) for v in obj]
+    if isinstance(obj, str) and _looks_secret(obj):
+        return "[REDACTED]"
+    return obj
+
+# =============================================================
 # Evidence extraction
-# =====================================================
+# =============================================================
+_EV_RE = re.compile(r"\b(ev_[A-Za-z0-9_-]+)\b")
 
-def extract_evidence(text):
+def _extract_evidence(text: str) -> List[str]:
+    if not isinstance(text, str):
+        return []
+    seen, out = set(), []
+    for m in _EV_RE.findall(text):
+        if m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
 
-    ids = re.findall(
-        r"\[(ev_[A-Za-z0-9_-]+)\]",
-        text
-    )
+# =============================================================
+# Diagnosis (root cause + evidence)
+# =============================================================
+def _diagnose(incident: dict) -> dict:
+    allowed = incident.get("allowedRootCauses") or []
+    transcript = (incident.get("transcript") or "").lower()
 
-    return list(
-        dict.fromkeys(ids)
-    )
-
-
-
-# =====================================================
-# Diagnosis + Proposal
-# =====================================================
-
-def diagnose(incident):
-
-    allowed = incident.get(
-        "allowedRootCauses",
-        []
-    )
-
-
-    transcript = incident.get(
-        "transcript",
-        ""
-    ).lower()
-
-
-
-    selected = None
-
-
+    best, best_score = None, 0
     for cause in allowed:
+        if not isinstance(cause, str):
+            continue
+        score = sum(
+            1 for w in cause.lower().split()
+            if len(w) > 3 and w in transcript
+        )
+        if score > best_score:
+            best_score = score
+            best = cause
 
-        score = 0
+    root_cause = best if best is not None else (allowed[0] if allowed else "unknown")
 
-
-        for word in cause.lower().split():
-
-            if len(word) > 3 and word in transcript:
-
-                score += 1
-
-
-        if score:
-
-            selected = cause
+    evidence = _extract_evidence(incident.get("transcript") or "")
+    # supplement from structured fields
+    for field in ("errorId", "traceId", "correlationId", "eventId"):
+        v = incident.get(field)
+        if isinstance(v, str) and v.startswith("ev_") and v not in evidence:
+            evidence.append(v)
+        if len(evidence) >= 4:
             break
-
-
-
-    if selected is None and allowed:
-
-        selected = allowed[0]
-
-
-
-    evidence = extract_evidence(
-        incident.get(
-            "transcript",
-            ""
-        )
-    )
-
-
-
     while len(evidence) < 2:
+        evidence.append("ev_unknown")
 
-        evidence.append(
-            "ev_unknown"
-        )
+    return {"rootCause": root_cause, "evidenceIds": evidence[:4]}
 
+# =============================================================
+# Tool selection (diagnostic, not effect)
+# =============================================================
+def _choose_diagnostic_tool(tools: list, policy: dict) -> Optional[dict]:
+    if not isinstance(tools, list) or not tools:
+        return None
+    effect_names = set()
+    if isinstance(policy, dict):
+        for n in policy.get("effectTools") or []:
+            if isinstance(n, str):
+                effect_names.add(n)
+    candidates = [
+        t for t in tools
+        if isinstance(t, dict) and isinstance(t.get("name"), str)
+        and t["name"] not in effect_names
+    ]
+    if not candidates:
+        return None
+    # prefer diagnostic-sounding tools
+    for kw in ("diagnos", "inspect", "check", "analyze", "probe", "trace"):
+        for t in candidates:
+            if kw in t["name"].lower():
+                return t
+    return candidates[0]
 
+def _build_tool_arguments(tool: dict, incident: dict, evidence: List[str]) -> dict:
+    """Case-derived arguments — use fields the tool actually needs."""
+    name = (tool.get("name") or "").lower()
+    schema = tool.get("inputSchema") or {}
+    props = schema.get("properties") if isinstance(schema, dict) else {}
 
-    return {
+    args: Dict[str, Any] = {}
+    service = incident.get("service") or incident.get("target") or ""
+    host = incident.get("host") or incident.get("hostname") or ""
+    region = incident.get("region") or incident.get("datacenter") or ""
+    start_ts = incident.get("startTime") or incident.get("startTs") or incident.get("since") or ""
+    end_ts = incident.get("endTime") or incident.get("endTs") or incident.get("until") or ""
 
-        "rootCause": selected,
+    for pname, pdef in (props.items() if isinstance(props, dict) else []):
+        ptype = (pdef.get("type") if isinstance(pdef, dict) else "") or ""
+        pl = pname.lower()
+        if pl in ("service", "servicename", "svc"):
+            args[pname] = service or "unknown"
+        elif pl in ("host", "hostname", "node"):
+            args[pname] = host or "unknown"
+        elif pl in ("region", "datacenter", "dc", "zone"):
+            args[pname] = region or "global"
+        elif pl in ("starttime", "startts", "since", "from"):
+            args[pname] = start_ts or ""
+        elif pl in ("endtime", "endts", "until", "to"):
+            args[pname] = end_ts or ""
+        elif pl in ("evidence", "evidenceids", "evidence_ids"):
+            args[pname] = evidence
+        elif pl in ("traceid", "trace_id"):
+            args[pname] = incident.get("traceId") or (evidence[0] if evidence else "")
+        elif ptype == "string":
+            args[pname] = ""
+        elif ptype == "integer" or ptype == "number":
+            args[pname] = 0
+        elif ptype == "boolean":
+            args[pname] = False
+        elif ptype == "array":
+            args[pname] = []
+        elif ptype == "object":
+            args[pname] = {}
 
-        "evidence":
-            evidence[:4]
+    # Always include service + evidence if schema is loose/empty
+    if "service" not in args and service:
+        args["service"] = service
+    if "evidence" not in args and "evidenceids" not in args:
+        args["evidence"] = evidence
+    return args
 
+# =============================================================
+# OTLP trace
+# =============================================================
+def _attr(key: str, value: Any) -> dict:
+    if isinstance(value, bool):
+        return {"key": key, "value": {"boolValue": value}}
+    if isinstance(value, int):
+        return {"key": key, "value": {"intValue": str(value)}}
+    return {"key": key, "value": {"stringValue": str(value)}}
+
+def _make_span(
+    trace_id: str,
+    span_id: str,
+    parent_id: str,
+    name: str,
+    kind: int,
+    attrs: List[dict],
+    links: Optional[List[dict]] = None,
+) -> dict:
+    s: Dict[str, Any] = {
+        "traceId": trace_id,
+        "spanId": span_id,
+        "name": name,
+        "kind": kind,
+        "attributes": attrs,
     }
+    if parent_id:
+        s["parentSpanId"] = parent_id
+    if links:
+        s["links"] = links
+    return s
 
+def _build_trace(
+    run_id: str,
+    marker: str,
+    action_id: str,
+    call_id: str,
+    tool_name: str,
+    root_cause: str,
+) -> tuple:
+    trace_id = hashlib.sha256(("q11|" + run_id).encode()).hexdigest()[:32]
 
-
-
-
-def build_proposal(
-    diagnosis,
-    dispatch
-):
-
-    return {
-
-        "rootCause":
-            diagnosis["rootCause"],
-
-
-        "evidenceIds":
-            diagnosis["evidence"],
-
-
-        "diagnosticActions":
-            [
-                {
-                    "actionId":
-                        dispatch["actionId"],
-
-                    "toolName":
-                        dispatch["toolName"],
-
-                    "arguments":
-                        dispatch["arguments"]
-                }
-            ],
-
-
-        "effectsAllowed":
-            False
-
-    }
-
-
-
-
-
-# =====================================================
-# Tool selection
-# =====================================================
-
-def choose_diagnostic_tool(
-    tools,
-    policy
-):
-
-    effects = policy.get(
-        "effectTools",
-        []
-    )
-
-
-    for tool in tools:
-
-        if tool.get("name") not in effects:
-
-            return tool
-
-
-    return None
-
-
-
-
-# =====================================================
-# OTLP Trace generation
-# =====================================================
-
-def create_trace(
-    run_id,
-    marker,
-    action_id,
-    call_id,
-    tool_name
-):
-
-
-    trace_id = hashlib.sha256(
-        (
-            run_id +
-            "trace"
-        ).encode()
-    ).hexdigest()[:32]
-
-
-
-    server_id = make_hex_id()
-    agent_id = make_hex_id()
-    model_id = make_hex_id()
-    tool_id = make_hex_id()
-    client_id = make_hex_id()
-    approval_id = make_hex_id()
-    join_id = make_hex_id()
-
-
+    server_id   = uuid.uuid4().hex[:16]
+    agent_id    = uuid.uuid4().hex[:16]
+    model_id    = uuid.uuid4().hex[:16]
+    plan_id     = uuid.uuid4().hex[:16]
+    tool_id     = uuid.uuid4().hex[:16]
+    client_id   = uuid.uuid4().hex[:16]
+    approval_id = uuid.uuid4().hex[:16]
+    join_id     = uuid.uuid4().hex[:16]
 
     common = [
-
-        attr(
-            "ga5.run.id",
-            run_id
-        ),
-
-        attr(
-            "ga5.public.marker",
-            marker
-        )
-
+        _attr("ga5.run.id", run_id),
+        _attr("ga5.public.marker", marker or ""),
+        _attr("ga5.root.cause", root_cause),
     ]
 
-
-
-    spans = []
-
-
-
-    # Root span
-
-    spans.append({
-
-        "traceId":
-            trace_id,
-
-        "spanId":
-            server_id,
-
-        "parentSpanId":
-            "",
-
-        "name":
-            "POST /v2/incidents",
-
-        "kind":
-            2,
-
-        "attributes":
-            common
-
-    })
-
-
-
-    # Agent span
-
-    spans.append({
-
-        "traceId":
-            trace_id,
-
-        "spanId":
-            agent_id,
-
-        "parentSpanId":
-            server_id,
-
-        "name":
-            "invoke_agent incident-response",
-
-        "kind":
-            1,
-
-        "attributes":
-            common
-
-    })
-
-
-
-    # Model span
-
-    spans.append({
-
-        "traceId":
-            trace_id,
-
-        "spanId":
-            model_id,
-
-        "parentSpanId":
-            agent_id,
-
-        "name":
-            "chat incident-plan",
-
-        "kind":
-            3,
-
-        "attributes":
-            common +
-            [
-
-                attr(
-                    "gen_ai.operation.name",
-                    "chat"
-                ),
-
-                attr(
-                    "gen_ai.request.model",
-                    "local-model"
-                )
-
-            ]
-
-    })
-
-
-
-    # Tool execution span
-
-    spans.append({
-
-        "traceId":
-            trace_id,
-
-        "spanId":
-            tool_id,
-
-        "parentSpanId":
-            agent_id,
-
-        "name":
-            "execute_tool " + tool_name,
-
-        "kind":
-            1,
-
-        "attributes":
-            common +
-            [
-
-                attr(
-                    "ga5.action.id",
-                    action_id
-                ),
-
-                attr(
-                    "gen_ai.tool.name",
-                    tool_name
-                ),
-
-                attr(
-                    "gen_ai.tool.call.id",
-                    call_id
-                )
-
-            ]
-
-    })
-
-
-
-    # Tool call span
-
-    spans.append({
-
-        "traceId":
-            trace_id,
-
-        "spanId":
-            client_id,
-
-        "parentSpanId":
-            tool_id,
-
-        "name":
-            "POST tool/" + tool_name,
-
-        "kind":
-            3,
-
-        "attributes":
-            common +
-            [
-
-                attr(
-                    "ga5.action.id",
-                    action_id
-                ),
-
-                attr(
-                    "ga5.attempt",
-                    1
-                ),
-
-                attr(
-                    "gen_ai.tool.call.id",
-                    call_id
-                )
-
-            ]
-
-    })
-
-
-
-    # NEW approval gate span
-
-    spans.append({
-
-        "traceId":
-            trace_id,
-
-        "spanId":
-            approval_id,
-
-        "parentSpanId":
-            agent_id,
-
-        "name":
-            "approval_gate",
-
-        "kind":
-            1,
-
-        "attributes":
-            common +
-            [
-
-                attr(
-                    "ga5.action.id",
-                    action_id
-                ),
-
-                attr(
-                    "ga5.approval.required",
-                    True
-                )
-
-            ]
-
-    })
-
-
-
-    # Final join
-
-    spans.append({
-
-        "traceId":
-            trace_id,
-
-        "spanId":
-            join_id,
-
-        "parentSpanId":
-            agent_id,
-
-        "name":
-            "incident.join",
-
-        "kind":
-            1,
-
-        "links":
-            [
-                {
-                    "traceId":
-                        trace_id,
-
-                    "spanId":
-                        tool_id
-                }
-            ],
-
-        "attributes":
-            common
-
-    })
-
-
-
-    traceparent = (
-        "00-"
-        +
-        trace_id
-        +
-        "-"
-        +
-        client_id
-        +
-        "-01"
-    )
-
-
-
+    spans = [
+        # 1. Root server span
+        _make_span(trace_id, server_id, "", "POST /v2/incidents", 2, common),
+        # 2. Agent invocation
+        _make_span(trace_id, agent_id, server_id,
+                   "invoke_agent incident-response", 1,
+                   common + [_attr("ga5.agent.name", "incident-agent")]),
+        # 3. Model plan span
+        _make_span(trace_id, model_id, agent_id,
+                   "chat incident-plan", 3,
+                   common + [
+                       _attr("gen_ai.operation.name", "chat"),
+                       _attr("gen_ai.request.model", "local-model"),
+                   ]),
+        # 4. Plan construction span (child of model)
+        _make_span(trace_id, plan_id, model_id,
+                   "plan build_proposal", 1,
+                   common + [_attr("ga5.action.id", action_id)]),
+        # 5. Tool execution span (child of agent)
+        _make_span(trace_id, tool_id, agent_id,
+                   "execute_tool " + tool_name, 1,
+                   common + [
+                       _attr("ga5.action.id", action_id),
+                       _attr("gen_ai.tool.name", tool_name),
+                       _attr("gen_ai.tool.call.id", call_id),
+                   ]),
+        # 6. Outbound tool call span (child of tool)
+        _make_span(trace_id, client_id, tool_id,
+                   "POST tool/" + tool_name, 3,
+                   common + [
+                       _attr("ga5.action.id", action_id),
+                       _attr("ga5.attempt", 1),
+                       _attr("gen_ai.tool.call.id", call_id),
+                   ]),
+        # 7. Approval gate (child of agent)
+        _make_span(trace_id, approval_id, agent_id,
+                   "approval_gate", 1,
+                   common + [
+                       _attr("ga5.action.id", action_id),
+                       _attr("ga5.approval.required", True),
+                   ]),
+        # 8. Final join (child of agent) with link to tool span
+        _make_span(trace_id, join_id, agent_id,
+                   "incident.join", 1,
+                   common + [_attr("ga5.action.id", action_id)],
+                   links=[{"traceId": trace_id, "spanId": tool_id}]),
+    ]
+
+    traceparent = f"00-{trace_id}-{client_id}-01"
     return spans, traceparent
 
-# =====================================================
+# =============================================================
 # POST /v2/incidents
-# =====================================================
-
+# =============================================================
 @router.post("/v2/incidents")
-async def create_incident(
-    request: Request
-):
+async def create_incident(request: Request):
+    raw = await request.body()
+    if len(raw) > MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="body too large")
+    try:
+        body = json.loads(raw or b"")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(status_code=422, detail="body is not valid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="body must be a JSON object")
 
-    body = await request.json()
+    if body.get("profile") != PROFILE:
+        raise HTTPException(status_code=400, detail="unsupported profile")
 
+    run_id = body.get("runId")
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise HTTPException(status_code=422, detail="runId is required")
+    run_id = run_id.strip()
 
+    incident = body.get("incident") or {}
+    policy   = body.get("policy") or {}
+    tools    = body.get("toolCatalog") or []
+    marker   = body.get("publicMarker") or ""
 
-    # -----------------------------
-    # Validate profile
-    # -----------------------------
+    if not isinstance(incident, dict) or not incident:
+        raise HTTPException(status_code=422, detail="incident is required")
 
-    if body.get("profile") != "ga5-incident-agent/v2":
+    # ---- Semantic conflict key (NOT over runId/marker) ----
+    conflict_key = _digest({
+        "incident": incident,
+        "policy": policy,
+        "toolCatalog": tools,
+    })
 
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid profile"
-        )
+    existing = _get_incident(run_id)
+    if existing is not None:
+        if existing["conflictKey"] == conflict_key:
+            # Idempotent replay
+            return JSONResponse(content=existing["response"], media_type="application/json")
+        # Different semantics under same runId -> 409
+        raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
 
+    # ---- Diagnosis ----
+    diagnosis = _diagnose(incident)
 
+    # ---- Tool selection ----
+    tool = _choose_diagnostic_tool(tools, policy)
+    if tool is None:
+        raise HTTPException(status_code=422, detail="no diagnostic tool available")
 
-    run_id = body.get(
-        "runId"
-    )
+    tool_name = tool["name"]
+    action_id = "action_" + uuid.uuid4().hex[:16]
+    call_id   = "call_"   + uuid.uuid4().hex[:16]
 
-
-    if not run_id:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Missing runId"
-        )
-
-
-
-    body_hash = stable_hash(
-        body
-    )
-
-
-
-    # -----------------------------
-    # Idempotency
-    # -----------------------------
-
-    if run_id in INCIDENTS_DB:
-
-
-        old = INCIDENTS_DB[run_id]
-
-
-        if old["hash"] != body_hash:
-
-            raise HTTPException(
-                status_code=409,
-                detail="IDEMPOTENCY_CONFLICT"
-            )
-
-
-        return old["response"]
-
-
-
-
-
-    incident = body.get(
-        "incident",
-        {}
-    )
-
-
-    policy = body.get(
-        "policy",
-        {}
-    )
-
-
-    tools = body.get(
-        "toolCatalog",
-        []
-    )
-
-
-
-    # -----------------------------
-    # Diagnosis
-    # -----------------------------
-
-    diagnosis = diagnose(
-        incident
-    )
-
-
-
-    diagnostic_tool = choose_diagnostic_tool(
-        tools,
-        policy
-    )
-
-
-
-    if not diagnostic_tool:
-
-        raise HTTPException(
-            status_code=422,
-            detail="No diagnostic tool"
-        )
-
-
-
-    tool_name = diagnostic_tool.get(
-        "name"
-    )
-
-
-
-    # -----------------------------
-    # IDs
-    # -----------------------------
-
-    action_id = make_id(
-        "action"
-    )
-
-
-    call_id = make_id(
-        "call"
-    )
-
-
+    arguments = _build_tool_arguments(tool, incident, diagnosis["evidenceIds"])
 
     dispatch = {
-
-
-        "actionId":
-            action_id,
-
-
-        "callId":
-            call_id,
-
-
-        "phase":
-            "diagnostic",
-
-
-        "toolName":
-            tool_name,
-
-
-        "arguments":
-            {
-
-                "service":
-                    incident.get(
-                        "service",
-                        ""
-                    )
-
-            },
-
-
-        "evidence":
-            diagnosis["evidence"],
-
-
-        "attempt":
-            1
-
+        "actionId": action_id,
+        "callId": call_id,
+        "phase": "diagnostic",
+        "toolName": tool_name,
+        "arguments": arguments,
+        "evidence": diagnosis["evidenceIds"],
+        "attempt": 1,
     }
 
-
-
-
-    spans, traceparent = create_trace(
-
-        run_id,
-
-        body.get(
-            "publicMarker",
-            ""
-        ),
-
-        action_id,
-
-        call_id,
-
-        tool_name
-
+    spans, traceparent = _build_trace(
+        run_id, marker, action_id, call_id, tool_name, diagnosis["rootCause"]
     )
-
-
-
     dispatch["traceparent"] = traceparent
 
-
-
-
-    # -----------------------------
-    # Proposal
-    # -----------------------------
-
-    proposal = build_proposal(
-
-        diagnosis,
-
-        dispatch
-
-    )
-
-
-
+    # ---- Proposal (BEFORE effects) ----
+    proposal = {
+        "rootCause": diagnosis["rootCause"],
+        "evidenceIds": diagnosis["evidenceIds"],
+        "diagnosticActions": [{
+            "actionId": action_id,
+            "toolName": tool_name,
+            "arguments": arguments,
+        }],
+        "effectsAllowed": False,
+    }
 
     response = {
-
-
-        "runId":
-
-            run_id,
-
-
-        "status":
-
-            "waiting",
-
-
-
-        "proposal":
-
-            proposal,
-
-
-
-        "diagnosis":
-
-            diagnosis,
-
-
-
-        "dispatches":
-
-            [
-
-                dispatch
-
-            ],
-
-
-
-        "approvals":
-
-            [],
-
-
-
-        "chosenEffect":
-
-            None,
-
-
-
-        "suppressed":
-
-            [],
-
-
-
-        "actionLog":
-
-            [
-
-                dispatch
-
-            ],
-
-
-
-        "toolResults":
-
-            [],
-
-
-
-        "receiptLog":
-
-            [],
-
-
-
-        "otlp":
-
-            {
-
-                "resourceSpans":
-
-                    [
-
-                        {
-
-                            "scopeSpans":
-
-                                [
-
-                                    {
-
-                                        "spans":
-
-                                            spans
-
-                                    }
-
-                                ]
-
-                        }
-
-                    ]
-
-            }
-
-
+        "profile": PROFILE,
+        "runId": run_id,
+        "status": "waiting",
+        "proposal": proposal,
+        "diagnosis": diagnosis,
+        "dispatches": [dispatch],
+        "approvals": [],
+        "chosenEffect": None,
+        "suppressed": [],
+        "actionLog": [dispatch],
+        "toolResults": [],
+        "receiptLog": [],
+        "otlp": {
+            "resourceSpans": [{
+                "scopeSpans": [{"spans": spans}],
+            }],
+        },
     }
 
+    response = _scrub(response)
+    _put_incident(run_id, conflict_key, response, body)
+    return JSONResponse(content=response, media_type="application/json")
 
+# =============================================================
+# POST /v2/incidents/{run_id}/receipts
+# =============================================================
+@router.post("/v2/incidents/{run_id}/receipts")
+async def receive_receipt(run_id: str, request: Request):
+    existing = _get_incident(run_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="incident run not found")
 
+    raw = await request.body()
+    try:
+        body = json.loads(raw or b"")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(status_code=422, detail="body is not valid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="body must be a JSON object")
 
-    INCIDENTS_DB[run_id] = {
+    receipt_hash = _digest(body)
+    receipt_key = f"{run_id}|{receipt_hash}"
 
+    cached = _get_receipt(receipt_key)
+    if cached is not None:
+        return JSONResponse(content=cached, media_type="application/json")
 
-        "hash":
+    state = existing["response"]
+    receipt_id = body.get("receiptId") or ("receipt_" + uuid.uuid4().hex[:16])
 
-            body_hash,
-
-
-        "body":
-
-            body,
-
-
-
-        "response":
-
-            response,
-
-
-
-        "lastReceiptHash":
-
-            None
-
-    }
-
-
-
-    return response
-# =====================================================
-# RECEIPTS
-# =====================================================
-
-@router.post(
-    "/v2/incidents/{run_id}/receipts"
-)
-async def receive_receipt(
-    run_id: str,
-    request: Request
-):
-
-
-    if run_id not in INCIDENTS_DB:
-
-        raise HTTPException(
-            status_code=404,
-            detail="Incident run not found"
-        )
-
-
-
-    body = await request.json()
-
-
-
-    receipt_hash = stable_hash(
-        body
-    )
-
-
-
-    state = INCIDENTS_DB[run_id]
-
-    response = state["response"]
-
-
-
-    # -----------------------------
-    # Receipt idempotency
-    # -----------------------------
-
-    if state.get("lastReceiptHash"):
-
-
-        if state["lastReceiptHash"] != receipt_hash:
-
-            raise HTTPException(
-                status_code=409,
-                detail="IDEMPOTENCY_CONFLICT"
-            )
-
-
-        return response
-
-
-
-
-
-    receipt_id = body.get(
-        "receiptId",
-        make_id("receipt")
-    )
-
-
-
-    # =================================================
-    # TOOL RESULTS
-    # =================================================
-
-    if "outcomes" in body:
-
-
+    # ---- Tool outcome receipts ----
+    if isinstance(body.get("outcomes"), list):
         for outcome in body["outcomes"]:
-
-
+            if not isinstance(outcome, dict):
+                continue
             tool_result = {
-
-
-                "receiptId":
-
-                    receipt_id,
-
-
-                "actionId":
-
-                    outcome.get(
-                        "actionId"
-                    ),
-
-
-                "callId":
-
-                    outcome.get(
-                        "callId"
-                    ),
-
-
-                "attempt":
-
-                    outcome.get(
-                        "attempt",
-                        1
-                    ),
-
-
-                "status":
-
-                    outcome.get(
-                        "status"
-                    ),
-
-
-                "resultClass":
-
-                    outcome.get(
-                        "resultClass"
-                    ),
-
-
-                "result":
-
-                    outcome.get(
-                        "result"
-                    ),
-
-
-                "nonce":
-
-                    outcome.get(
-                        "nonce"
-                    )
-
+                "receiptId": receipt_id,
+                "actionId": outcome.get("actionId"),
+                "callId": outcome.get("callId"),
+                "attempt": outcome.get("attempt", 1),
+                "status": outcome.get("status"),
+                "resultClass": outcome.get("resultClass"),
+                "result": outcome.get("result"),
+                "nonce": outcome.get("nonce"),
             }
+            state["toolResults"].append(tool_result)
+            state["receiptLog"].append(tool_result)
 
-
-
-            response["toolResults"].append(
-                tool_result
-            )
-
-
-
-            response["receiptLog"].append(
-                tool_result
-            )
-
-
-
-            # -------------------------
-            # Update trace receipt data
-            # -------------------------
-
-            for rs in response["otlp"]["resourceSpans"]:
-
-                for ss in rs["scopeSpans"]:
-
-                    for span in ss["spans"]:
-
-
-                        if span["name"].startswith(
-                            "POST tool/"
-                        ):
-
-
+            # annotate the outbound tool span
+            for rs in state.get("otlp", {}).get("resourceSpans", []):
+                for ss in rs.get("scopeSpans", []):
+                    for span in ss.get("spans", []):
+                        if isinstance(span.get("name"), str) and span["name"].startswith("POST tool/"):
+                            span["attributes"].append(_attr("ga5.receipt.id", receipt_id))
                             span["attributes"].append(
-
-                                attr(
-                                    "ga5.receipt.id",
-                                    receipt_id
-                                )
-
+                                _attr("http.status_code", outcome.get("status", 200))
                             )
 
-
-                            span["attributes"].append(
-
-                                attr(
-                                    "http.status_code",
-                                    outcome.get(
-                                        "status",
-                                        200
-                                    )
-                                )
-
-                            )
-
-
-
-        # diagnostic completed
-
-        response["dispatches"] = []
-
-
-
-        # -------------------------
-        # Effect proposal after tool
-        # -------------------------
-
-        effect_tools = state["body"].get(
-            "policy",
-            {}
-        ).get(
-            "effectTools",
-            []
-        )
-
-
-
-        if effect_tools:
-
-
-            effect_action = response["actionLog"][0]
-
-
+        # diagnostic phase complete -> propose effect
+        state["dispatches"] = []
+        effect_tools = (existing["body"].get("policy") or {}).get("effectTools") or []
+        if effect_tools and isinstance(effect_tools, list):
+            effect_name = effect_tools[0]
+            incident = existing["body"].get("incident") or {}
+            prev = state["actionLog"][-1] if state["actionLog"] else {}
             effect_dispatch = {
-
-
-                "actionId":
-
-                    effect_action["actionId"],
-
-
-                "callId":
-
-                    make_id(
-                        "call"
-                    ),
-
-
-                "phase":
-
-                    "effect",
-
-
-                "toolName":
-
-                    effect_tools[0],
-
-
-
-                "arguments":
-
-                    {
-
-                        "service":
-
-                            state["body"]
-                            ["incident"]
-                            .get(
-                                "service",
-                                ""
-                            )
-
-                    },
-
-
-                "evidence":
-
-                    response["diagnosis"]
-                    ["evidence"],
-
-
-                "attempt":
-
-                    1,
-
-
-                "traceparent":
-
-                    effect_action["traceparent"]
-
+                "actionId": prev.get("actionId") or ("action_" + uuid.uuid4().hex[:16]),
+                "callId": "call_" + uuid.uuid4().hex[:16],
+                "phase": "effect",
+                "toolName": effect_name,
+                "arguments": {"service": incident.get("service") or ""},
+                "evidence": state["diagnosis"]["evidenceIds"],
+                "attempt": 1,
+                "traceparent": prev.get("traceparent") or "",
             }
-
-
-
-            response["dispatches"] = [
-
-                effect_dispatch
-
-            ]
-
-
-
-            response["actionLog"].append(
-                effect_dispatch
-            )
-
-
-
-            response["chosenEffect"] = effect_tools[0]
-
-
-
-            response["status"] = "waiting"
-
-
-
+            state["dispatches"] = [effect_dispatch]
+            state["actionLog"].append(effect_dispatch)
+            state["chosenEffect"] = effect_name
+            state["status"] = "waiting"
         else:
+            state["status"] = "completed"
 
+        _put_incident(run_id, existing["conflictKey"], state, existing["body"])
+        _put_receipt(receipt_key, state)
+        return JSONResponse(content=_scrub(state), media_type="application/json")
 
-            response["status"] = "completed"
-
-
-
-        state["lastReceiptHash"] = receipt_hash
-
-
-        return response
-
-
-
-
-
-    # =================================================
-    # APPROVAL RECEIPT
-    # =================================================
-
-    if "approvals" in body:
-
-
+    # ---- Approval receipts ----
+    if isinstance(body.get("approvals"), list):
         for approval in body["approvals"]:
+            if not isinstance(approval, dict):
+                continue
+            state["receiptLog"].append({
+                "receiptId": receipt_id,
+                "approvalId": approval.get("approvalId"),
+                "decision": approval.get("decision"),
+                "nonce": approval.get("nonce"),
+            })
+        state["dispatches"] = []
+        state["status"] = "completed"
+        _put_incident(run_id, existing["conflictKey"], state, existing["body"])
+        _put_receipt(receipt_key, state)
+        return JSONResponse(content=_scrub(state), media_type="application/json")
 
+    # ---- Default completion ----
+    state["dispatches"] = []
+    state["status"] = "completed"
+    _put_incident(run_id, existing["conflictKey"], state, existing["body"])
+    _put_receipt(receipt_key, state)
+    return JSONResponse(content=_scrub(state), media_type="application/json")
 
-            approval_record = {
-
-
-                "receiptId":
-
-                    receipt_id,
-
-
-                "approvalId":
-
-                    approval.get(
-                        "approvalId"
-                    ),
-
-
-                "decision":
-
-                    approval.get(
-                        "decision"
-                    ),
-
-
-                "nonce":
-
-                    approval.get(
-                        "nonce"
-                    )
-
-            }
-
-
-            response["receiptLog"].append(
-                approval_record
-            )
-
-
-
-        response["dispatches"] = []
-
-        response["status"] = "completed"
-
-
-
-        state["lastReceiptHash"] = receipt_hash
-
-
-        return response
-
-
-
-
-
-    # =================================================
-    # DEFAULT COMPLETION
-    # =================================================
-
-    response["dispatches"] = []
-
-    response["status"] = "completed"
-
-
-
-    state["lastReceiptHash"] = receipt_hash
-
-
-
-    return response
-
-
-
-
-
-# =====================================================
-# GET INCIDENT STATE
-# =====================================================
-
-@router.get(
-    "/v2/incidents/{run_id}"
-)
-async def get_incident(
-    run_id: str
-):
-
-
-    if run_id not in INCIDENTS_DB:
-
-        raise HTTPException(
-            status_code=404,
-            detail="Incident run not found"
-        )
-
-
-    return INCIDENTS_DB[run_id]["response"]
+# =============================================================
+# GET /v2/incidents/{run_id}
+# =============================================================
+@router.get("/v2/incidents/{run_id}")
+async def get_incident(run_id: str):
+    existing = _get_incident(run_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="incident run not found")
+    return JSONResponse(content=existing["response"], media_type="application/json")
