@@ -7,7 +7,6 @@ GET  /v2/incidents/{run_id}     -> current state
 Storage: SQLite WAL + atomic JSON files (durable across restarts).
 Conflict detection: semantic digest over (incident, policy, toolCatalog).
 """
-import asyncio
 import hashlib
 import json
 import os
@@ -32,15 +31,9 @@ MAX_BODY_BYTES = 4 * 1024 * 1024
 # Persistence (SQLite WAL + atomic JSON files)
 # =============================================================
 def _db_path() -> str:
-    want = os.environ.get("GA5_DB", "/tmp/ga5.db")
-    parent = os.path.dirname(want) or "."
-    try:
-        os.makedirs(parent, exist_ok=True)
-        with open(want, "ab"):
-            pass
-        return want
-    except OSError:
-        return os.path.join(tempfile.gettempdir(), "ga5.db")
+    # Use current working directory to ensure disk persistence 
+    # and avoid ephemeral /tmp issues in containerized environments.
+    return os.path.join(os.getcwd(), "ga5.db")
 
 DB_PATH = _db_path()
 
@@ -99,7 +92,7 @@ def _get_incident(run_id: str) -> Optional[dict]:
     except Exception as e:
         logger.error("q11 get incident sqlite error: %s", e)
     
-    json_path = os.path.join(tempfile.gettempdir(), f"q11_incident_{run_id}.json")
+    json_path = os.path.join(os.getcwd(), f"q11_incident_{run_id}.json")
     if os.path.exists(json_path):
         try:
             with open(json_path, "r", encoding="utf-8") as f:
@@ -121,7 +114,7 @@ def _put_incident(run_id: str, conflict_key: str, response: dict, body: dict) ->
         logger.error("q11 put incident sqlite error: %s", e)
     
     _atomic_json_write(
-        os.path.join(tempfile.gettempdir(), f"q11_incident_{run_id}.json"),
+        os.path.join(os.getcwd(), f"q11_incident_{run_id}.json"),
         {"conflictKey": conflict_key, "response": response, "body": body},
     )
 
@@ -253,6 +246,7 @@ def _choose_diagnostic_tool(tools: list, policy: dict) -> Optional[dict]:
 def _build_tool_arguments(tool: dict, incident: dict, evidence: List[str]) -> dict:
     schema = tool.get("inputSchema") or {}
     props = schema.get("properties") if isinstance(schema, dict) else {}
+    required = schema.get("required") if isinstance(schema, dict) else []
     
     args = {}
     mapping = {
@@ -273,18 +267,19 @@ def _build_tool_arguments(tool: dict, incident: dict, evidence: List[str]) -> di
         
         if pl in mapping:
             args[pname] = mapping[pl]
-        elif ptype == "string":
-            args[pname] = ""
-        elif ptype == "integer" or ptype == "number":
-            args[pname] = 0
-        elif ptype == "boolean":
-            args[pname] = False
-        elif ptype == "array":
-            args[pname] = []
-        elif ptype == "object":
-            args[pname] = {}
-        else:
-            args[pname] = ""
+        elif pname in required:
+            if ptype == "string":
+                args[pname] = ""
+            elif ptype == "integer" or ptype == "number":
+                args[pname] = 0
+            elif ptype == "boolean":
+                args[pname] = False
+            elif ptype == "array":
+                args[pname] = []
+            elif ptype == "object":
+                args[pname] = {}
+            else:
+                args[pname] = ""
             
     if not args:
         args = {
@@ -331,6 +326,7 @@ def _build_trace(
     marker: str,
     action_id: str,
     call_id: str,
+    approval_id_val: str,
     tool_name: str,
 ) -> tuple:
     trace_id = hashlib.sha256(("q11|" + run_id).encode()).hexdigest()[:32]
@@ -342,7 +338,6 @@ def _build_trace(
     client_id   = uuid.uuid4().hex[:16]
     approval_id = uuid.uuid4().hex[:16]
     join_id     = uuid.uuid4().hex[:16]
-    approval_id_val = "approval_" + uuid.uuid4().hex[:16]
 
     common = [
         _attr("ga5.run.id", run_id),
@@ -445,32 +440,29 @@ async def create_incident(request: Request):
     tool_name = tool["name"]
     action_id = "action_" + uuid.uuid4().hex[:16]
     call_id   = "call_"   + uuid.uuid4().hex[:16]
+    approval_id_val = "approval_" + uuid.uuid4().hex[:16]
 
     arguments = _build_tool_arguments(tool, incident, diagnosis["evidenceIds"])
 
     dispatch = {
         "actionId": action_id,
         "callId": call_id,
+        "approvalId": approval_id_val,
         "phase": "diagnostic",
         "toolName": tool_name,
         "arguments": arguments,
-        "evidence": diagnosis["evidenceIds"],
         "evidenceIds": diagnosis["evidenceIds"],
         "attempt": 1,
     }
 
-    spans, traceparent = _build_trace(run_id, marker, action_id, call_id, tool_name)
+    spans, traceparent = _build_trace(run_id, marker, action_id, call_id, approval_id_val, tool_name)
     dispatch["traceparent"] = traceparent
 
     # Proposal (BEFORE effects)
     proposal = {
         "rootCause": diagnosis["rootCause"],
         "evidenceIds": diagnosis["evidenceIds"],
-        "diagnosticActions": [{
-            "actionId": action_id,
-            "toolName": tool_name,
-            "arguments": arguments,
-        }],
+        "diagnosticDispatches": [dispatch],
         "effectsAllowed": False,
     }
 
