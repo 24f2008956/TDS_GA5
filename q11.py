@@ -31,8 +31,15 @@ MAX_BODY_BYTES = 4 * 1024 * 1024
 # Persistence (SQLite WAL + atomic JSON files)
 # =============================================================
 def _db_path() -> str:
-    # Use /tmp to guarantee write permissions in containerized environments
-    return "/tmp/ga5_q11.db"
+    want = os.environ.get("GA5_DB", "/tmp/ga5.db")
+    parent = os.path.dirname(want) or "."
+    try:
+        os.makedirs(parent, exist_ok=True)
+        with open(want, "ab"):
+            pass
+        return want
+    except OSError:
+        return os.path.join(tempfile.gettempdir(), "ga5.db")
 
 DB_PATH = _db_path()
 
@@ -91,7 +98,7 @@ def _get_incident(run_id: str) -> Optional[dict]:
     except Exception as e:
         logger.error("q11 get incident sqlite error: %s", e)
     
-    json_path = os.path.join("/tmp", f"q11_incident_{run_id}.json")
+    json_path = os.path.join(tempfile.gettempdir(), f"q11_incident_{run_id}.json")
     if os.path.exists(json_path):
         try:
             with open(json_path, "r", encoding="utf-8") as f:
@@ -113,7 +120,7 @@ def _put_incident(run_id: str, conflict_key: str, response: dict, body: dict) ->
         logger.error("q11 put incident sqlite error: %s", e)
     
     _atomic_json_write(
-        os.path.join("/tmp", f"q11_incident_{run_id}.json"),
+        os.path.join(tempfile.gettempdir(), f"q11_incident_{run_id}.json"),
         {"conflictKey": conflict_key, "response": response, "body": body},
     )
 
@@ -248,28 +255,39 @@ def _build_tool_arguments(tool: dict, incident: dict, evidence: List[str]) -> di
     required = schema.get("required") if isinstance(schema, dict) else []
     
     args = {}
-    mapping = {
-        "service": incident.get("service") or incident.get("target") or "",
-        "host": incident.get("host") or incident.get("hostname") or "",
-        "region": incident.get("region") or incident.get("datacenter") or "",
-        "startTime": incident.get("startTime") or incident.get("startTs") or "",
-        "endTime": incident.get("endTime") or incident.get("endTs") or "",
-        "traceId": incident.get("traceId") or (evidence[0] if evidence else ""),
-        "errorId": incident.get("errorId") or (evidence[1] if len(evidence) > 1 else ""),
-        "evidenceIds": evidence,
-        "evidence": evidence,
-    }
+    
+    service_val = str(incident.get("service") or incident.get("target") or incident.get("serviceName") or "unknown")
+    host_val = str(incident.get("host") or incident.get("hostname") or incident.get("node") or "unknown")
+    region_val = str(incident.get("region") or incident.get("datacenter") or incident.get("zone") or "global")
+    start_val = str(incident.get("startTime") or incident.get("startTs") or incident.get("since") or "")
+    end_val = str(incident.get("endTime") or incident.get("endTs") or incident.get("until") or "")
+    trace_val = str(incident.get("traceId") or (evidence[0] if evidence and str(evidence[0]).startswith("ev_") else ""))
+    error_val = str(incident.get("errorId") or incident.get("errorCode") or (evidence[1] if len(evidence) > 1 and str(evidence[1]).startswith("ev_") else ""))
     
     for pname, pdef in (props.items() if isinstance(props, dict) else {}):
-        ptype = (pdef.get("type") if isinstance(pdef, dict) else "") or ""
+        ptype = str(pdef.get("type") if isinstance(pdef, dict) else "")
         pl = pname.lower()
         
-        if pl in mapping:
-            args[pname] = mapping[pl]
+        if pl in ("service", "servicename", "svc"):
+            args[pname] = service_val
+        elif pl in ("host", "hostname", "node"):
+            args[pname] = host_val
+        elif pl in ("region", "datacenter", "dc", "zone"):
+            args[pname] = region_val
+        elif pl in ("starttime", "startts", "since", "from"):
+            args[pname] = start_val
+        elif pl in ("endtime", "endts", "until", "to"):
+            args[pname] = end_val
+        elif pl in ("traceid", "trace_id"):
+            args[pname] = trace_val
+        elif pl in ("errorid", "error_id", "errorcode"):
+            args[pname] = error_val
+        elif pl in ("evidenceids", "evidence_ids", "evidence"):
+            args[pname] = evidence
         elif pname in required:
             if ptype == "string":
                 args[pname] = ""
-            elif ptype == "integer" or ptype == "number":
+            elif ptype in ("integer", "number"):
                 args[pname] = 0
             elif ptype == "boolean":
                 args[pname] = False
@@ -279,7 +297,7 @@ def _build_tool_arguments(tool: dict, incident: dict, evidence: List[str]) -> di
                 args[pname] = {}
             else:
                 args[pname] = ""
-            
+                
     return args
 
 # =============================================================
@@ -342,8 +360,8 @@ def _build_trace(
         _make_span(trace_id, server_id, "", "POST /v2/incidents", 2, common),
         # 2. Agent invocation span
         _make_span(trace_id, agent_id, server_id, "invoke_agent incident-response", 1, common),
-        # 3. Model span (INTERNAL kind)
-        _make_span(trace_id, model_id, agent_id, "chat incident-plan", 1, common + [
+        # 3. Model span (CLIENT kind for external LLM call)
+        _make_span(trace_id, model_id, agent_id, "chat incident-plan", 3, common + [
             _attr("gen_ai.operation.name", "chat"),
             _attr("gen_ai.request.model", "local-model")
         ]),
@@ -457,6 +475,11 @@ async def create_incident(request: Request):
         "rootCause": diagnosis["rootCause"],
         "evidenceIds": diagnosis["evidenceIds"],
         "diagnosticActions": [{
+            "actionId": action_id,
+            "toolName": tool_name,
+            "arguments": arguments,
+        }],
+        "diagnosticDispatches": [{
             "actionId": action_id,
             "toolName": tool_name,
             "arguments": arguments,
