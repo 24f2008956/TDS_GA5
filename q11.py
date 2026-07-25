@@ -31,9 +31,8 @@ MAX_BODY_BYTES = 4 * 1024 * 1024
 # Persistence (SQLite WAL + atomic JSON files)
 # =============================================================
 def _db_path() -> str:
-    # Use current working directory to ensure disk persistence 
-    # and avoid ephemeral /tmp issues in containerized environments.
-    return os.path.join(os.getcwd(), "ga5.db")
+    # Use /tmp to guarantee write permissions in containerized environments
+    return "/tmp/ga5_q11.db"
 
 DB_PATH = _db_path()
 
@@ -92,7 +91,7 @@ def _get_incident(run_id: str) -> Optional[dict]:
     except Exception as e:
         logger.error("q11 get incident sqlite error: %s", e)
     
-    json_path = os.path.join(os.getcwd(), f"q11_incident_{run_id}.json")
+    json_path = os.path.join("/tmp", f"q11_incident_{run_id}.json")
     if os.path.exists(json_path):
         try:
             with open(json_path, "r", encoding="utf-8") as f:
@@ -114,7 +113,7 @@ def _put_incident(run_id: str, conflict_key: str, response: dict, body: dict) ->
         logger.error("q11 put incident sqlite error: %s", e)
     
     _atomic_json_write(
-        os.path.join(os.getcwd(), f"q11_incident_{run_id}.json"),
+        os.path.join("/tmp", f"q11_incident_{run_id}.json"),
         {"conflictKey": conflict_key, "response": response, "body": body},
     )
 
@@ -250,9 +249,9 @@ def _build_tool_arguments(tool: dict, incident: dict, evidence: List[str]) -> di
     
     args = {}
     mapping = {
-        "service": incident.get("service") or incident.get("target") or "unknown",
-        "host": incident.get("host") or incident.get("hostname") or "unknown",
-        "region": incident.get("region") or incident.get("datacenter") or "global",
+        "service": incident.get("service") or incident.get("target") or "",
+        "host": incident.get("host") or incident.get("hostname") or "",
+        "region": incident.get("region") or incident.get("datacenter") or "",
         "startTime": incident.get("startTime") or incident.get("startTs") or "",
         "endTime": incident.get("endTime") or incident.get("endTs") or "",
         "traceId": incident.get("traceId") or (evidence[0] if evidence else ""),
@@ -281,12 +280,6 @@ def _build_tool_arguments(tool: dict, incident: dict, evidence: List[str]) -> di
             else:
                 args[pname] = ""
             
-    if not args:
-        args = {
-            "service": mapping["service"],
-            "evidenceIds": evidence,
-        }
-        
     return args
 
 # =============================================================
@@ -349,8 +342,8 @@ def _build_trace(
         _make_span(trace_id, server_id, "", "POST /v2/incidents", 2, common),
         # 2. Agent invocation span
         _make_span(trace_id, agent_id, server_id, "invoke_agent incident-response", 1, common),
-        # 3. Model span
-        _make_span(trace_id, model_id, agent_id, "chat incident-plan", 3, common + [
+        # 3. Model span (INTERNAL kind)
+        _make_span(trace_id, model_id, agent_id, "chat incident-plan", 1, common + [
             _attr("gen_ai.operation.name", "chat"),
             _attr("gen_ai.request.model", "local-model")
         ]),
@@ -358,6 +351,7 @@ def _build_trace(
         _make_span(trace_id, tool_id, agent_id, "execute_tool " + tool_name, 1, common + [
             _attr("ga5.action.id", action_id),
             _attr("ga5.call.id", call_id),
+            _attr("ga5.attempt", 1),
             _attr("gen_ai.tool.name", tool_name),
             _attr("gen_ai.tool.call.id", call_id)
         ]),
@@ -462,7 +456,16 @@ async def create_incident(request: Request):
     proposal = {
         "rootCause": diagnosis["rootCause"],
         "evidenceIds": diagnosis["evidenceIds"],
-        "diagnosticDispatches": [dispatch],
+        "diagnosticActions": [{
+            "actionId": action_id,
+            "toolName": tool_name,
+            "arguments": arguments,
+        }],
+        "diagnosticToolDispatches": [{
+            "actionId": action_id,
+            "toolName": tool_name,
+            "arguments": arguments,
+        }],
         "effectsAllowed": False,
     }
 
